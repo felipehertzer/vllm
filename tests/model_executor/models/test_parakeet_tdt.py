@@ -3,7 +3,6 @@
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 import torch.nn as nn
 
@@ -43,47 +42,83 @@ def test_parakeet_tdt_forced_tokens_fall_back_to_eos_after_sequence_end():
     assert forced.tolist() == [11, 99]
 
 
-def test_parakeet_tdt_forward_uses_internal_single_request_state():
+def test_parakeet_tdt_forced_tokens_follow_request_indices():
+    state = ParakeetTDTForcedDecoderState(eos_token_id=99)
+    state.set_sequences([[11, 12], [21, 22]])
+
+    forced = state.get_forced_token_ids(
+        positions=torch.tensor([1, 0], dtype=torch.long),
+        request_indices=torch.tensor([0, 1], dtype=torch.long),
+        device=torch.device("cpu"),
+    )
+
+    assert forced.tolist() == [12, 21]
+
+
+def test_parakeet_tdt_forward_uses_explicit_forced_decoder_ids():
     model = ParakeetForTDT.__new__(ParakeetForTDT)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(vocab_size=100, eos_token_id=99)
-    model._forced_decoder_state = ParakeetTDTForcedDecoderState(eos_token_id=99)
+
+    logits = ParakeetForTDT.forward(
+        model,
+        input_ids=torch.zeros(2, dtype=torch.long),
+        positions=torch.tensor([0, 0], dtype=torch.long),
+        forced_decoder_ids=torch.tensor([12, 22], dtype=torch.long),
+    )
+
+    assert logits.argmax(dim=-1).tolist() == [12, 22]
+
+
+def test_parakeet_tdt_forward_uses_per_request_forced_sequences():
+    model = ParakeetForTDT.__new__(ParakeetForTDT)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(vocab_size=100, eos_token_id=99)
+
+    logits = ParakeetForTDT.forward(
+        model,
+        input_ids=torch.zeros(2, dtype=torch.long),
+        positions=torch.tensor([0, 1], dtype=torch.long),
+        forced_decoder_sequences=[[11, 12], [21, 22]],
+        forced_decoder_request_indices=torch.tensor([0, 1], dtype=torch.long),
+    )
+
+    assert logits.argmax(dim=-1).tolist() == [11, 22]
+
+
+def test_parakeet_tdt_forward_without_decoder_state_uses_eos():
+    model = ParakeetForTDT.__new__(ParakeetForTDT)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(vocab_size=100, eos_token_id=99)
+
+    logits = ParakeetForTDT.forward(
+        model,
+        input_ids=torch.zeros(2, dtype=torch.long),
+        positions=torch.tensor([0, 0], dtype=torch.long),
+    )
+
+    assert logits.argmax(dim=-1).tolist() == [99, 99]
+
+
+def test_parakeet_tdt_forward_decodes_multiple_encoder_outputs():
+    model = ParakeetForTDT.__new__(ParakeetForTDT)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(vocab_size=100, eos_token_id=99)
     model.model = SimpleNamespace(
-        greedy_decode=lambda encoder_output: [int(encoder_output.item()), 99]
+        greedy_decode_batch=lambda encoder_outputs: [
+            [int(encoder_output.item()), 99] for encoder_output in encoder_outputs
+        ]
     )
 
     logits = ParakeetForTDT.forward(
         model,
-        input_ids=torch.zeros(1, dtype=torch.long),
-        positions=torch.tensor([0], dtype=torch.long),
-        encoder_outputs=[torch.tensor(11)],
-    )
-    assert logits.argmax(dim=-1).tolist() == [11]
-
-    logits = ParakeetForTDT.forward(
-        model,
-        input_ids=torch.zeros(1, dtype=torch.long),
-        positions=torch.tensor([1], dtype=torch.long),
-    )
-    assert logits.argmax(dim=-1).tolist() == [99]
-
-
-def test_parakeet_tdt_forward_rejects_multiple_encoder_outputs():
-    model = ParakeetForTDT.__new__(ParakeetForTDT)
-    nn.Module.__init__(model)
-    model.config = SimpleNamespace(vocab_size=100, eos_token_id=99)
-    model._forced_decoder_state = ParakeetTDTForcedDecoderState(eos_token_id=99)
-    model.model = SimpleNamespace(
-        greedy_decode=lambda encoder_output: [int(encoder_output.item()), 99]
+        input_ids=torch.zeros(2, dtype=torch.long),
+        positions=torch.tensor([0, 0], dtype=torch.long),
+        encoder_outputs=[torch.tensor(11), torch.tensor(21)],
+        forced_decoder_request_indices=torch.tensor([0, 1], dtype=torch.long),
     )
 
-    with pytest.raises(ValueError, match="one active encoder output"):
-        ParakeetForTDT.forward(
-            model,
-            input_ids=torch.zeros(2, dtype=torch.long),
-            positions=torch.tensor([0, 0], dtype=torch.long),
-            encoder_outputs=[torch.tensor(11), torch.tensor(21)],
-        )
+    assert logits.argmax(dim=-1).tolist() == [11, 21]
 
 
 def test_parakeet_tdt_config_updates_runtime_metadata():
@@ -102,8 +137,8 @@ def test_parakeet_tdt_config_updates_runtime_metadata():
     assert MODELS_CONFIG_MAP["ParakeetForTDT"] is ParakeetForTDTConfig
     ParakeetForTDTConfig.verify_and_update_config(vllm_config)
 
-    assert model_config.enforce_eager is True
-    assert scheduler_config.max_num_seqs == 1
+    assert model_config.enforce_eager is False
+    assert scheduler_config.max_num_seqs == 8
     assert model_config.override_generation_config == {"eos_token_id": 3}
 
 
@@ -250,3 +285,57 @@ def test_parakeet_tdt_greedy_decode_does_not_skip_after_positive_duration():
     )
 
     assert token_ids == [0, 1, 2, 9]
+
+
+def test_parakeet_tdt_greedy_decode_batch_matches_single_decode():
+    class FakeDecoder:
+        def predict(self, token_id, state, device):
+            del token_id, state
+            next_state = (
+                torch.zeros(1, 1, 1, device=device),
+                torch.zeros(1, 1, 1, device=device),
+            )
+            return torch.zeros(1, 1, device=device), next_state
+
+        def predict_batch(self, token_ids, state, rows):
+            del state
+            next_state = (
+                torch.zeros(1, rows.numel(), 1, device=token_ids.device),
+                torch.zeros(1, rows.numel(), 1, device=token_ids.device),
+            )
+            return torch.zeros(rows.numel(), 1, device=token_ids.device), next_state
+
+    def joint_logits(encoder_frame, pred_state):
+        del pred_state
+        token_ids = encoder_frame[:, 0].to(dtype=torch.long)
+        logits = torch.full(
+            (encoder_frame.shape[0], 11), -1.0, device=encoder_frame.device
+        )
+        logits[torch.arange(encoder_frame.shape[0]), token_ids] = 1.0
+        logits[:, 10] = 1.0
+        return logits
+
+    fake_model = SimpleNamespace(
+        config=SimpleNamespace(
+            vocab_size=10,
+            blank_token_id=8,
+            eos_token_id=9,
+            durations=[1],
+            max_symbols_per_step=1,
+        ),
+        decoder=FakeDecoder(),
+        encoder_projector=lambda encoder_output: encoder_output,
+        _joint_logits=joint_logits,
+    )
+    encoder_outputs = [
+        torch.tensor([[0.0], [1.0], [2.0]]),
+        torch.tensor([[3.0], [4.0]]),
+    ]
+
+    batch_token_ids = ParakeetTDTModel.greedy_decode_batch(fake_model, encoder_outputs)
+    single_token_ids = [
+        ParakeetTDTModel.greedy_decode(fake_model, encoder_output)
+        for encoder_output in encoder_outputs
+    ]
+
+    assert batch_token_ids == single_token_ids

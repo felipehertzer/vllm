@@ -465,6 +465,10 @@ class GPUModelRunner(
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
+        self.is_parakeet_tdt = "ParakeetForTDT" in getattr(
+            model_config, "architectures", ()
+        )
+        self.parakeet_tdt_forced_decoder_sequences: dict[str, list[int]] = {}
 
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
@@ -1132,6 +1136,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self.parakeet_tdt_forced_decoder_sequences.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -3077,6 +3082,71 @@ class GPUModelRunner(
 
         return encoder_outputs
 
+    def _get_parakeet_tdt_encoder_output_req_ids(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> list[str]:
+        req_ids: list[str] = []
+        for (
+            req_id,
+            encoder_input_ids,
+        ) in scheduler_output.scheduled_encoder_inputs.items():
+            req_state = self.requests[req_id]
+            for mm_input_id in encoder_input_ids:
+                mm_feature = req_state.mm_features[mm_input_id]
+                if mm_feature.data is None:
+                    continue
+                req_ids.append(req_id)
+        return req_ids
+
+    def _decode_parakeet_tdt_encoder_outputs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        encoder_outputs: Sequence[torch.Tensor],
+    ) -> None:
+        if not encoder_outputs:
+            return
+
+        req_ids = self._get_parakeet_tdt_encoder_output_req_ids(scheduler_output)
+        if len(req_ids) != len(encoder_outputs):
+            raise ValueError(
+                "Parakeet TDT encoder output count does not match scheduled "
+                f"request count: {len(encoder_outputs)} != {len(req_ids)}."
+            )
+
+        sequences = self.model.model.greedy_decode_batch(encoder_outputs)
+        for req_id, sequence in zip(req_ids, sequences, strict=True):
+            self.parakeet_tdt_forced_decoder_sequences[req_id] = sequence
+
+    def _get_parakeet_tdt_forced_decoder_ids(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_input_tokens: int,
+    ) -> torch.Tensor:
+        eos_token_id = int(self.model_config.hf_config.eos_token_id)
+        forced_decoder_ids: list[int] = []
+
+        for req_index, req_id in enumerate(self.input_batch.req_ids):
+            num_scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            start_pos = int(self.input_batch.num_computed_tokens_cpu[req_index])
+            sequence = self.parakeet_tdt_forced_decoder_sequences.get(req_id, ())
+            for position in range(start_pos, start_pos + num_scheduled):
+                if 0 <= position < len(sequence):
+                    forced_decoder_ids.append(sequence[position])
+                else:
+                    forced_decoder_ids.append(eos_token_id)
+
+        if len(forced_decoder_ids) < num_input_tokens:
+            forced_decoder_ids.extend(
+                [eos_token_id] * (num_input_tokens - len(forced_decoder_ids))
+            )
+
+        return torch.tensor(
+            forced_decoder_ids[:num_input_tokens],
+            dtype=torch.long,
+            device=self.device,
+        )
+
     def _gather_mm_embeddings(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3511,10 +3581,22 @@ class GPUModelRunner(
             # Run the encoder, just like we do with other multimodal inputs.
             # For an encoder-decoder model, our processing here is a bit
             # simpler, because the outputs are just passed to the decoder.
-            # We are not doing any prompt replacement. We also will only
-            # ever have a single encoder input.
+            # We are not doing any prompt replacement.
             encoder_outputs = self._execute_mm_encoder(scheduler_output)
-            model_kwargs.update({"encoder_outputs": encoder_outputs})
+            if self.is_parakeet_tdt:
+                self._decode_parakeet_tdt_encoder_outputs(
+                    scheduler_output, encoder_outputs
+                )
+            else:
+                model_kwargs.update({"encoder_outputs": encoder_outputs})
+
+        if self.is_parakeet_tdt:
+            model_kwargs["forced_decoder_ids"] = (
+                self._get_parakeet_tdt_forced_decoder_ids(
+                    scheduler_output,
+                    num_input_tokens,
+                )
+            )
 
         return (
             input_ids,
@@ -5864,6 +5946,14 @@ class GPUModelRunner(
                 num_tokens_padded = ubatch_slices_padded[0].num_tokens
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
+
+            if self.is_parakeet_tdt:
+                model_kwargs["forced_decoder_ids"] = torch.full(
+                    (num_tokens_padded,),
+                    int(self.model_config.hf_config.eos_token_id),
+                    dtype=torch.long,
+                    device=self.device,
+                )
 
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),

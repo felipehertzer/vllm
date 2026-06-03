@@ -493,26 +493,10 @@ class ParakeetForTDTConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         model_config = vllm_config.model_config
-        scheduler_config = getattr(vllm_config, "scheduler_config", None)
-        if scheduler_config is not None and scheduler_config.max_num_seqs != 1:
-            logger.warning_once(
-                "Parakeet TDT currently stores decoder state inside the model "
-                "and supports one active request; limiting max_num_seqs to 1 "
-                "to keep decoding state correct."
-            )
-            scheduler_config.max_num_seqs = 1
 
         model_config.override_generation_config.setdefault(
             "eos_token_id", model_config.hf_config.eos_token_id
         )
-
-        if not model_config.enforce_eager:
-            logger.warning_once(
-                "Parakeet TDT uses stateful decoder outputs; enforcing "
-                "eager execution to avoid CUDA graph replaying stale forced "
-                "tokens."
-            )
-        model_config.enforce_eager = True
 
 
 class Qwen2ForProcessRewardModelConfig(VerifyAndUpdateConfig):
