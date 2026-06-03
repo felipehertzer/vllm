@@ -1,15 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import time
 from typing import Any
 
 import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.states import RequestState
+
+logger = init_logger(__name__)
+
+
+def _parakeet_profile_enabled() -> bool:
+    return os.getenv("PARAKEET_PROFILE", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _sync_if_cuda(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
 
 
 class ParakeetTDTModelState(DefaultModelState):
@@ -29,6 +43,7 @@ class ParakeetTDTModelState(DefaultModelState):
             dtype=torch.long,
             device=device,
         )
+        self._last_encoder_ms = 0.0
 
     def get_supported_generation_tasks(self):
         return ("transcription",)
@@ -69,11 +84,19 @@ class ParakeetTDTModelState(DefaultModelState):
         )
         _, mm_kwargs = self.encoder_runner.prepare_mm_inputs(encoder_inputs)
         if mm_kwargs:
+            profile = _parakeet_profile_enabled()
+            if profile:
+                _sync_if_cuda(self.device)
+                started_at = time.perf_counter()
             self.encoder_outputs = self.encoder_runner.execute_mm_encoder(mm_kwargs)
+            if profile:
+                _sync_if_cuda(self.device)
+                self._last_encoder_ms = (time.perf_counter() - started_at) * 1000
             self.encoder_output_req_ids = encoder_req_ids
         else:
             self.encoder_outputs = []
             self.encoder_output_req_ids = []
+            self._last_encoder_ms = 0.0
         return None
 
     def _decode_encoder_outputs(self) -> None:
@@ -86,7 +109,23 @@ class ParakeetTDTModelState(DefaultModelState):
                 f"{len(self.encoder_outputs)} != {len(self.encoder_output_req_ids)}."
             )
 
+        profile = _parakeet_profile_enabled()
+        if profile:
+            _sync_if_cuda(self.device)
+            started_at = time.perf_counter()
         sequences = self.model.model.greedy_decode_batch(self.encoder_outputs)
+        if profile:
+            _sync_if_cuda(self.device)
+            tdt_decode_ms = (time.perf_counter() - started_at) * 1000
+            output_tokens = sum(len(sequence) for sequence in sequences)
+            logger.info(
+                "Parakeet profile encoder_ms=%.2f tdt_decode_ms=%.2f "
+                "chunks=%d output_tokens=%d",
+                self._last_encoder_ms,
+                tdt_decode_ms,
+                len(self.encoder_outputs),
+                output_tokens,
+            )
         for req_id, sequence in zip(
             self.encoder_output_req_ids,
             sequences,

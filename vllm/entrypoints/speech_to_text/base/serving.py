@@ -3,6 +3,7 @@
 import asyncio
 import io
 import math
+import os
 import time
 import zlib
 from collections.abc import AsyncGenerator, Callable, Set
@@ -71,6 +72,10 @@ ResponseType: TypeAlias = (
 )
 
 logger = init_logger(__name__)
+
+
+def _parakeet_profile_enabled() -> bool:
+    return os.getenv("PARAKEET_PROFILE", "").lower() in {"1", "true", "yes", "on"}
 
 
 def asr_inter_chunk_separator(
@@ -188,12 +193,50 @@ class OpenAISpeechToText(OpenAIServing):
         logger.info("Auto-detected language: '%s'", lang)
         return lang
 
+    def _decode_and_chunk_audio(
+        self,
+        audio_data: bytes,
+        *,
+        filename: str | None,
+        content_type: str | None,
+    ) -> tuple[list[np.ndarray], float]:
+        with io.BytesIO(audio_data) as buf:
+            y, sr = load_audio(
+                buf,
+                sr=self.asr_config.sample_rate,
+                filename=filename,
+                content_type=content_type,
+            )
+
+        duration = get_audio_duration(y=y, sr=sr)
+        do_split_audio = self.asr_config.allow_audio_chunking and (
+            self.asr_config.max_audio_clip_s is not None
+            and duration > self.asr_config.max_audio_clip_s
+        )
+
+        if not do_split_audio:
+            return [y], duration
+
+        assert self.asr_config.max_audio_clip_s is not None
+        assert self.asr_config.min_energy_split_window_size is not None
+        chunks = split_audio(
+            audio_data=y,
+            sample_rate=int(sr),
+            max_clip_duration_s=self.asr_config.max_audio_clip_s,
+            overlap_duration_s=self.asr_config.overlap_chunk_second,
+            min_energy_window_size=self.asr_config.min_energy_split_window_size,
+        )
+        return chunks, duration
+
     async def _preprocess_speech_to_text(
         self,
         request: SpeechToTextRequest,
         audio_data: bytes,
         request_id: str,
-    ) -> tuple[list[EngineInput], float]:
+        *,
+        filename: str | None = None,
+        content_type: str | None = None,
+    ) -> tuple[list[EngineInput], float, float, int]:
         # Validate request
         request.language = self.model_cls.validate_language(request.language)
         request.to_language = (
@@ -209,35 +252,21 @@ class OpenAISpeechToText(OpenAIServing):
                 value=len(audio_data) / 1024**2,
             )
 
-        # Decode audio bytes.  For container formats (MP4, M4A, WebM) that
-        # soundfile cannot detect from a BytesIO stream, _load_audio_bytes
-        # transparently falls back to ffmpeg via an in-memory fd.
-        # NOTE resample to model SR here for efficiency. This is also a
-        # pre-requisite for chunking, as it assumes Whisper SR.
+        # Decode/resample/chunking can do codec and CPU work; keep it out of the
+        # FastAPI event loop so concurrent requests can keep moving.
+        decode_started_at = time.perf_counter()
         try:
-            with io.BytesIO(audio_data) as buf:
-                y, sr = load_audio(buf, sr=self.asr_config.sample_rate)
-        except Exception as exc:
-            raise ValueError("Invalid or unsupported audio file.") from exc
-
-        duration = get_audio_duration(y=y, sr=sr)
-        do_split_audio = self.asr_config.allow_audio_chunking and (
-            self.asr_config.max_audio_clip_s is not None
-            and duration > self.asr_config.max_audio_clip_s
-        )
-
-        if not do_split_audio:
-            chunks = [y]
-        else:
-            assert self.asr_config.max_audio_clip_s is not None
-            assert self.asr_config.min_energy_split_window_size is not None
-            chunks = split_audio(
-                audio_data=y,
-                sample_rate=int(sr),
-                max_clip_duration_s=self.asr_config.max_audio_clip_s,
-                overlap_duration_s=self.asr_config.overlap_chunk_second,
-                min_energy_window_size=self.asr_config.min_energy_split_window_size,
+            chunks, duration = await asyncio.to_thread(
+                self._decode_and_chunk_audio,
+                audio_data,
+                filename=filename,
+                content_type=content_type,
             )
+        except Exception as exc:
+            raise VLLMValidationError(
+                "Invalid or unsupported audio file.", parameter="file"
+            ) from exc
+        audio_decode_ms = (time.perf_counter() - decode_started_at) * 1000
 
         if request.language is None and getattr(
             self.model_cls, "supports_explicit_language_detection", False
@@ -268,7 +297,7 @@ class OpenAISpeechToText(OpenAIServing):
 
         engine_inputs = await self.renderer.render_cmpl_async(parsed_prompts)
 
-        return engine_inputs, duration
+        return engine_inputs, duration, audio_decode_ms, len(chunks)
 
     def _preprocess_verbose_prompt(self, prompt: EncoderDecoderDictPrompt):
         dec_prompt = prompt["decoder_prompt"]
@@ -382,9 +411,13 @@ class OpenAISpeechToText(OpenAIServing):
         raw_request: Request,
         response_class: type[ResponseType],
         stream_generator_method: Callable[..., AsyncGenerator[str, None]],
+        *,
+        filename: str | None = None,
+        content_type: str | None = None,
     ) -> T | V | AsyncGenerator[str, None] | ErrorResponse:
         """Base method for speech-to-text operations like transcription and
         translation."""
+        request_started_at = time.perf_counter()
         if request.stream and request.use_beam_search:
             return self.create_error_response(
                 "Streaming is not currently supported with beam search"
@@ -429,10 +462,14 @@ class OpenAISpeechToText(OpenAIServing):
 
         lora_request = self._maybe_get_adapters(request)
 
-        engine_inputs, duration_s = await self._preprocess_speech_to_text(
-            request=request,
-            audio_data=audio_data,
-            request_id=request_id,
+        engine_inputs, duration_s, audio_decode_ms, chunk_count = (
+            await self._preprocess_speech_to_text(
+                request=request,
+                audio_data=audio_data,
+                request_id=request_id,
+                filename=filename,
+                content_type=content_type,
+            )
         )
 
         # Schedule the request and get the result generator.
@@ -524,6 +561,15 @@ class OpenAISpeechToText(OpenAIServing):
         )
 
         if request.stream:
+            if _parakeet_profile_enabled():
+                logger.info(
+                    "Parakeet STT profile request_id=%s audio_decode_ms=%.2f "
+                    "chunks=%d duration_s=%.2f stream=True",
+                    request_id,
+                    audio_decode_ms,
+                    chunk_count,
+                    duration_s,
+                )
             return stream_generator_method(
                 request,
                 list_result_generator,
@@ -614,6 +660,17 @@ class OpenAISpeechToText(OpenAIServing):
                             segments=total_segments,
                         ),
                     )
+            if _parakeet_profile_enabled():
+                total_ms = (time.perf_counter() - request_started_at) * 1000
+                logger.info(
+                    "Parakeet STT profile request_id=%s audio_decode_ms=%.2f "
+                    "total_ms=%.2f chunks=%d duration_s=%.2f",
+                    request_id,
+                    audio_decode_ms,
+                    total_ms,
+                    chunk_count,
+                    duration_s,
+                )
             return final_response
         except asyncio.CancelledError:
             logger.info(

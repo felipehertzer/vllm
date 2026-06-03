@@ -439,11 +439,13 @@ class ParakeetTDTModel(nn.Module):
     ) -> list[list[int]]:
         if not encoder_outputs:
             return []
-        if len(encoder_outputs) == 1:
-            return [self.greedy_decode(encoder_outputs[0])]
 
         cfg = self.config
         device = encoder_outputs[0].device
+        batch_size = len(encoder_outputs)
+        max_encoder_frames = max(
+            int(encoder_output.shape[0]) for encoder_output in encoder_outputs
+        )
         lengths = torch.tensor(
             [int(encoder_output.shape[0]) for encoder_output in encoder_outputs],
             dtype=torch.long,
@@ -453,8 +455,6 @@ class ParakeetTDTModel(nn.Module):
             nn.utils.rnn.pad_sequence(list(encoder_outputs), batch_first=True)
         )
 
-        batch_size = len(encoder_outputs)
-        token_ids: list[list[int]] = [[] for _ in range(batch_size)]
         time_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
         last_tokens = torch.full(
             (batch_size,),
@@ -464,16 +464,32 @@ class ParakeetTDTModel(nn.Module):
         )
         has_last_token = torch.zeros(batch_size, dtype=torch.bool, device=device)
         state: tuple[torch.Tensor, torch.Tensor] | None = None
+        duration_values = torch.tensor(cfg.durations, dtype=torch.long, device=device)
+        max_output_tokens = max_encoder_frames * cfg.max_symbols_per_step + 1
+        output_ids = torch.full(
+            (batch_size, max_output_tokens),
+            cfg.eos_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        output_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
 
-        while bool(torch.any(time_idx < lengths).item()):
+        for _ in range(max_encoder_frames):
             active = torch.nonzero(time_idx < lengths, as_tuple=False).flatten()
+            if active.numel() == 0:
+                break
             symbols_added = torch.zeros(
                 active.shape[0], dtype=torch.long, device=device
             )
             needs_loop = torch.ones(active.shape[0], dtype=torch.bool, device=device)
+            still_looping_after_limit = torch.zeros(
+                active.shape[0], dtype=torch.bool, device=device
+            )
 
-            while active.numel() and bool(torch.any(needs_loop).item()):
+            for _symbol_step in range(cfg.max_symbols_per_step):
                 loop_positions = torch.nonzero(needs_loop, as_tuple=False).flatten()
+                if loop_positions.numel() == 0:
+                    break
                 loop_rows = active[loop_positions]
                 labels = torch.where(
                     has_last_token[loop_rows],
@@ -490,12 +506,8 @@ class ParakeetTDTModel(nn.Module):
                 token_logits = logits[:, : cfg.vocab_size].float()
                 duration_logits = logits[:, cfg.vocab_size :].float()
                 tokens = token_logits.argmax(dim=1)
-                duration_indices = duration_logits.argmax(dim=1).tolist()
-                skips = torch.tensor(
-                    [cfg.durations[index] for index in duration_indices],
-                    dtype=torch.long,
-                    device=device,
-                )
+                duration_indices = duration_logits.argmax(dim=1)
+                skips = duration_values[duration_indices]
                 blank_tokens = tokens == cfg.blank_token_id
                 skips = torch.where(
                     blank_tokens & (skips == 0),
@@ -504,53 +516,58 @@ class ParakeetTDTModel(nn.Module):
                 )
                 nonblank_tokens = ~blank_tokens
 
-                if bool(torch.any(nonblank_tokens).item()):
-                    nonblank_rows = loop_rows[nonblank_tokens]
-                    nonblank_tokens_cpu = tokens[nonblank_tokens].tolist()
-                    for row, token_id in zip(
-                        nonblank_rows.tolist(), nonblank_tokens_cpu, strict=True
-                    ):
-                        token_ids[row].append(int(token_id))
+                nonblank_rows = loop_rows[nonblank_tokens]
+                emit_positions = output_lengths[nonblank_rows]
+                output_ids[nonblank_rows, emit_positions] = tokens[nonblank_tokens]
+                output_lengths[nonblank_rows] += 1
 
-                    last_tokens[nonblank_rows] = tokens[nonblank_tokens]
-                    has_last_token[nonblank_rows] = True
-                    if state is None:
-                        num_layers = next_state[0].shape[0]
-                        hidden_size = next_state[0].shape[-1]
-                        state = (
-                            torch.zeros(
-                                num_layers,
-                                batch_size,
-                                hidden_size,
-                                dtype=next_state[0].dtype,
-                                device=device,
-                            ),
-                            torch.zeros(
-                                num_layers,
-                                batch_size,
-                                hidden_size,
-                                dtype=next_state[1].dtype,
-                                device=device,
-                            ),
-                        )
-                    state[0][:, nonblank_rows, :] = next_state[0][:, nonblank_tokens, :]
-                    state[1][:, nonblank_rows, :] = next_state[1][:, nonblank_tokens, :]
+                last_tokens[nonblank_rows] = tokens[nonblank_tokens]
+                has_last_token[nonblank_rows] = True
+                if state is None:
+                    num_layers = next_state[0].shape[0]
+                    hidden_size = next_state[0].shape[-1]
+                    state = (
+                        torch.zeros(
+                            num_layers,
+                            batch_size,
+                            hidden_size,
+                            dtype=next_state[0].dtype,
+                            device=device,
+                        ),
+                        torch.zeros(
+                            num_layers,
+                            batch_size,
+                            hidden_size,
+                            dtype=next_state[1].dtype,
+                            device=device,
+                        ),
+                    )
+                state[0][:, nonblank_rows, :] = next_state[0][:, nonblank_tokens, :]
+                state[1][:, nonblank_rows, :] = next_state[1][:, nonblank_tokens, :]
 
                 time_idx[loop_rows] += skips
                 symbols_added[loop_positions] += 1
+                still_looping_after_limit[loop_positions] = skips == 0
                 needs_loop[loop_positions] = (skips == 0) & (
                     symbols_added[loop_positions] < cfg.max_symbols_per_step
                 )
 
-            if active.numel():
-                still_looping = active[needs_loop]
-                if still_looping.numel():
-                    time_idx[still_looping] += 1
+            advance_after_limit = active[
+                still_looping_after_limit & (symbols_added >= cfg.max_symbols_per_step)
+            ]
+            time_idx[advance_after_limit] += 1
 
-        for sequence in token_ids:
-            sequence.append(cfg.eos_token_id)
+        eos_positions = output_lengths.clamp(max=max_output_tokens - 1)
+        batch_indices = torch.arange(batch_size, dtype=torch.long, device=device)
+        output_ids[batch_indices, eos_positions] = cfg.eos_token_id
+        output_lengths = eos_positions + 1
 
-        return token_ids
+        output_ids_cpu = output_ids.cpu()
+        output_lengths_cpu = output_lengths.cpu().tolist()
+        return [
+            output_ids_cpu[row, :output_length].tolist()
+            for row, output_length in enumerate(output_lengths_cpu)
+        ]
 
 
 @MULTIMODAL_REGISTRY.register_processor(

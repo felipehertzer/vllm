@@ -6,10 +6,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-from vllm.model_executor.models.config import (
-    MODELS_CONFIG_MAP,
-    ParakeetForTDTConfig,
-)
+from vllm.model_executor.models.config import MODELS_CONFIG_MAP, ParakeetForTDTConfig
 from vllm.model_executor.models.parakeet_tdt import (
     ParakeetForTDT,
     ParakeetTDTForcedDecoderState,
@@ -158,6 +155,7 @@ def test_parakeet_tdt_model_state_reuses_forced_token_buffer():
         output_token_counts=torch.tensor([1]),
         num_tokens=4,
     )
+    assert first.tolist() == [12, 12, 12, 12]
     first_data_ptr = first.data_ptr()
 
     second = ParakeetTDTModelState._build_forced_decoder_ids(
@@ -168,7 +166,6 @@ def test_parakeet_tdt_model_state_reuses_forced_token_buffer():
         num_tokens=4,
     )
 
-    assert first.tolist() == [12, 12, 12, 12]
     assert second.tolist() == [13, 13, 13, 13]
     assert second.data_ptr() == first_data_ptr
 
@@ -391,3 +388,199 @@ def test_parakeet_tdt_greedy_decode_batch_matches_single_decode():
     ]
 
     assert batch_token_ids == single_token_ids
+
+
+def test_parakeet_tdt_greedy_decode_batch_handles_single_item_batch():
+    class FakeDecoder:
+        def predict_batch(self, token_ids, state, rows):
+            del state
+            next_state = (
+                torch.zeros(1, rows.numel(), 1, device=token_ids.device),
+                torch.zeros(1, rows.numel(), 1, device=token_ids.device),
+            )
+            return torch.zeros(rows.numel(), 1, device=token_ids.device), next_state
+
+    def joint_logits(encoder_frame, pred_state):
+        del pred_state
+        token_ids = encoder_frame[:, 0].to(dtype=torch.long)
+        logits = torch.full(
+            (encoder_frame.shape[0], 11), -1.0, device=encoder_frame.device
+        )
+        logits[torch.arange(encoder_frame.shape[0]), token_ids] = 1.0
+        logits[:, 10] = 1.0
+        return logits
+
+    fake_model = SimpleNamespace(
+        config=SimpleNamespace(
+            vocab_size=10,
+            blank_token_id=8,
+            eos_token_id=9,
+            durations=[1],
+            max_symbols_per_step=1,
+        ),
+        decoder=FakeDecoder(),
+        encoder_projector=lambda encoder_output: encoder_output,
+        _joint_logits=joint_logits,
+    )
+
+    token_ids = ParakeetTDTModel.greedy_decode_batch(
+        fake_model,
+        [torch.tensor([[0.0], [1.0], [2.0]])],
+    )
+
+    assert token_ids == [[0, 1, 2, 9]]
+
+
+def test_parakeet_tdt_greedy_decode_batch_handles_nonblank_duration_zero():
+    class FakeDecoder:
+        def predict(self, token_id, state, device):
+            del state
+            next_state = (
+                torch.zeros(1, 1, 1, device=device),
+                torch.zeros(1, 1, 1, device=device),
+            )
+            return torch.tensor([[float(token_id)]], device=device), next_state
+
+        def predict_batch(self, token_ids, state, rows):
+            del state
+            next_state = (
+                torch.zeros(1, rows.numel(), 1, device=token_ids.device),
+                torch.zeros(1, rows.numel(), 1, device=token_ids.device),
+            )
+            return token_ids.float().unsqueeze(1), next_state
+
+    def joint_logits(encoder_frame, pred_state):
+        del encoder_frame
+        labels = pred_state[:, 0].to(dtype=torch.long)
+        token_ids = torch.where(labels == 4, 0, 1)
+        duration_indices = torch.where(labels == 4, 0, 1)
+        logits = torch.full((labels.shape[0], 7), -1.0, device=labels.device)
+        logits[torch.arange(labels.shape[0]), token_ids] = 1.0
+        logits[torch.arange(labels.shape[0]), 5 + duration_indices] = 1.0
+        return logits
+
+    fake_model = SimpleNamespace(
+        config=SimpleNamespace(
+            vocab_size=5,
+            blank_token_id=4,
+            eos_token_id=3,
+            durations=[0, 1],
+            max_symbols_per_step=4,
+        ),
+        decoder=FakeDecoder(),
+        encoder_projector=lambda encoder_output: encoder_output,
+        _joint_logits=joint_logits,
+    )
+    encoder_outputs = [torch.zeros(1, 1), torch.zeros(1, 1)]
+
+    batch_token_ids = ParakeetTDTModel.greedy_decode_batch(fake_model, encoder_outputs)
+    single_token_ids = [
+        ParakeetTDTModel.greedy_decode(fake_model, encoder_output)
+        for encoder_output in encoder_outputs
+    ]
+
+    assert batch_token_ids == single_token_ids == [[0, 1, 3], [0, 1, 3]]
+
+
+def test_parakeet_tdt_greedy_decode_batch_advances_at_symbol_limit():
+    class FakeDecoder:
+        def predict(self, token_id, state, device):
+            del state
+            next_state = (
+                torch.zeros(1, 1, 1, device=device),
+                torch.zeros(1, 1, 1, device=device),
+            )
+            return torch.tensor([[float(token_id)]], device=device), next_state
+
+        def predict_batch(self, token_ids, state, rows):
+            del state
+            next_state = (
+                torch.zeros(1, rows.numel(), 1, device=token_ids.device),
+                torch.zeros(1, rows.numel(), 1, device=token_ids.device),
+            )
+            return token_ids.float().unsqueeze(1), next_state
+
+    def joint_logits(encoder_frame, pred_state):
+        del encoder_frame
+        labels = pred_state[:, 0].to(dtype=torch.long)
+        token_ids = torch.where(labels == 4, 0, 1)
+        logits = torch.full((labels.shape[0], 7), -1.0, device=labels.device)
+        logits[torch.arange(labels.shape[0]), token_ids] = 1.0
+        logits[:, 5] = 1.0
+        return logits
+
+    fake_model = SimpleNamespace(
+        config=SimpleNamespace(
+            vocab_size=5,
+            blank_token_id=4,
+            eos_token_id=3,
+            durations=[0, 1],
+            max_symbols_per_step=2,
+        ),
+        decoder=FakeDecoder(),
+        encoder_projector=lambda encoder_output: encoder_output,
+        _joint_logits=joint_logits,
+    )
+    encoder_outputs = [torch.zeros(1, 1), torch.zeros(1, 1)]
+
+    batch_token_ids = ParakeetTDTModel.greedy_decode_batch(fake_model, encoder_outputs)
+    single_token_ids = [
+        ParakeetTDTModel.greedy_decode(fake_model, encoder_output)
+        for encoder_output in encoder_outputs
+    ]
+
+    assert batch_token_ids == single_token_ids == [[0, 1, 3], [0, 1, 3]]
+
+
+def test_parakeet_tdt_greedy_decode_batch_handles_positive_duration_skip():
+    class FakeDecoder:
+        def predict(self, token_id, state, device):
+            del token_id, state
+            next_state = (
+                torch.zeros(1, 1, 1, device=device),
+                torch.zeros(1, 1, 1, device=device),
+            )
+            return torch.zeros(1, 1, device=device), next_state
+
+        def predict_batch(self, token_ids, state, rows):
+            del state
+            next_state = (
+                torch.zeros(1, rows.numel(), 1, device=token_ids.device),
+                torch.zeros(1, rows.numel(), 1, device=token_ids.device),
+            )
+            return torch.zeros(rows.numel(), 1, device=token_ids.device), next_state
+
+    def joint_logits(encoder_frame, pred_state):
+        del pred_state
+        token_ids = encoder_frame[:, 0].to(dtype=torch.long)
+        logits = torch.full(
+            (encoder_frame.shape[0], 11), -1.0, device=encoder_frame.device
+        )
+        logits[torch.arange(encoder_frame.shape[0]), token_ids] = 1.0
+        logits[:, 10] = 1.0
+        return logits
+
+    fake_model = SimpleNamespace(
+        config=SimpleNamespace(
+            vocab_size=10,
+            blank_token_id=8,
+            eos_token_id=9,
+            durations=[2],
+            max_symbols_per_step=1,
+        ),
+        decoder=FakeDecoder(),
+        encoder_projector=lambda encoder_output: encoder_output,
+        _joint_logits=joint_logits,
+    )
+    encoder_outputs = [
+        torch.tensor([[0.0], [1.0], [2.0], [3.0], [4.0]]),
+        torch.tensor([[5.0], [6.0], [7.0]]),
+    ]
+
+    batch_token_ids = ParakeetTDTModel.greedy_decode_batch(fake_model, encoder_outputs)
+    single_token_ids = [
+        ParakeetTDTModel.greedy_decode(fake_model, encoder_output)
+        for encoder_output in encoder_outputs
+    ]
+
+    assert batch_token_ids == single_token_ids == [[0, 2, 4, 9], [5, 7, 9]]

@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -228,6 +229,16 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+def _parakeet_profile_enabled() -> bool:
+    return os.getenv("PARAKEET_PROFILE", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _sync_if_cuda(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -3123,7 +3134,21 @@ class GPUModelRunner(
                 f"request count: {len(encoder_outputs)} != {len(req_ids)}."
             )
 
+        profile = _parakeet_profile_enabled()
+        if profile:
+            _sync_if_cuda(self.device)
+            started_at = time.perf_counter()
         sequences = self.model.model.greedy_decode_batch(encoder_outputs)
+        if profile:
+            _sync_if_cuda(self.device)
+            tdt_decode_ms = (time.perf_counter() - started_at) * 1000
+            output_tokens = sum(len(sequence) for sequence in sequences)
+            logger.info(
+                "Parakeet profile tdt_decode_ms=%.2f chunks=%d output_tokens=%d",
+                tdt_decode_ms,
+                len(encoder_outputs),
+                output_tokens,
+            )
         for req_id, sequence in zip(req_ids, sequences, strict=True):
             self.parakeet_tdt_forced_decoder_sequences[req_id] = sequence
 

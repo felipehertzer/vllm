@@ -9,10 +9,7 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
-from vllm.entrypoints.utils import (
-    load_aware_call,
-    with_cancellation,
-)
+from vllm.entrypoints.utils import load_aware_call, with_cancellation
 from vllm.logger import init_logger
 
 from .protocol import TranscriptionRequest, TranscriptionResponseVariant
@@ -46,8 +43,16 @@ async def create_transcriptions(
         raise NotImplementedError("The model does not support Transcriptions API")
 
     audio_data = await request.file.read()
+    filename = request.file.filename
+    content_type = request.file.content_type
 
-    generator = await handler.create_transcription(audio_data, request, raw_request)
+    generator = await handler.create_transcription(
+        audio_data,
+        request,
+        raw_request,
+        filename=filename,
+        content_type=content_type,
+    )
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(

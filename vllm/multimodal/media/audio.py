@@ -40,6 +40,45 @@ except ImportError:
 # 3 = malformed file           (corrupt or structurally invalid audio)
 # 4 = unsupported encoding     (codec not supported by this libsndfile build)
 _BAD_SF_CODES = {0, 1, 3, 4}
+_PYAV_FIRST_EXTENSIONS = {
+    ".m4a",
+    ".mp3",
+    ".mp4",
+    ".mpeg",
+    ".mpga",
+    ".webm",
+}
+_PYAV_FIRST_CONTENT_TYPES = {
+    "audio/m4a",
+    "audio/mp4",
+    "audio/mpeg",
+    "audio/mpga",
+    "audio/webm",
+    "audio/x-m4a",
+    "video/mp4",
+    "video/webm",
+}
+
+
+def _should_try_pyav_first(
+    path: BytesIO | Path | str,
+    *,
+    filename: str | None,
+    content_type: str | None,
+) -> bool:
+    if filename is None and isinstance(path, (Path, str)):
+        filename = str(path)
+
+    if filename is not None:
+        suffix = Path(filename).suffix.lower()
+        if suffix in _PYAV_FIRST_EXTENSIONS:
+            return True
+
+    if content_type is not None:
+        normalized_type = content_type.split(";", 1)[0].strip().lower()
+        return normalized_type in _PYAV_FIRST_CONTENT_TYPES
+
+    return False
 
 
 def load_audio_pyav(
@@ -134,7 +173,17 @@ def load_audio(
     *,
     sr: float | None = 22050,
     mono: bool = True,
+    filename: str | None = None,
+    content_type: str | None = None,
 ):
+    if _should_try_pyav_first(path, filename=filename, content_type=content_type):
+        try:
+            return load_audio_pyav(path, sr=sr, mono=mono)
+        except ImportError:
+            raise
+        except Exception as pyav_exc:
+            raise ValueError("Invalid or unsupported audio file.") from pyav_exc
+
     try:
         return load_audio_soundfile(path, sr=sr, mono=mono)
     except ImportError as exc:

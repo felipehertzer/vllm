@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -76,3 +77,23 @@ def test_audio_media_io_from_video(video_assets):
     audio_ref, sr_ref = load_audio(video_path, sr=None)
     assert sr == sr_ref
     np.testing.assert_allclose(audio_ref, audio, atol=1e-4)
+
+
+def test_load_audio_uses_pyav_first_for_container_hint():
+    expected = (np.array([0.0, 0.1], dtype=np.float32), 16000)
+    with (
+        patch(
+            "vllm.multimodal.media.audio.load_audio_pyav", return_value=expected
+        ) as pyav_load,
+        patch("vllm.multimodal.media.audio.load_audio_soundfile") as soundfile_load,
+    ):
+        actual = load_audio(
+            BytesIO(b"fake-mp3"),
+            filename="sample.mp3",
+            content_type="audio/mpeg",
+        )
+
+    np.testing.assert_array_equal(actual[0], expected[0])
+    assert actual[1] == expected[1]
+    pyav_load.assert_called_once()
+    soundfile_load.assert_not_called()

@@ -52,6 +52,9 @@ class OpenAIServingTranscription(OpenAISpeechToText):
         audio_data: bytes,
         request: TranscriptionRequest,
         raw_request: Request | None = None,
+        *,
+        filename: str | None = None,
+        content_type: str | None = None,
     ) -> (
         TranscriptionResponse
         | TranscriptionResponseVerbose
@@ -73,6 +76,8 @@ class OpenAIServingTranscription(OpenAISpeechToText):
                 else TranscriptionResponse
             ),
             stream_generator_method=self.transcription_stream_generator,
+            filename=filename,
+            content_type=content_type,
         )
 
     async def transcription_stream_generator(
