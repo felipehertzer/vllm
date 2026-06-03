@@ -8,7 +8,9 @@ class ParakeetTDTConfig(PretrainedConfig):
     """Configuration for NVIDIA Parakeet TDT checkpoints.
 
     Transformers versions that include the Parakeet encoder do not yet expose
-    the TDT wrapper used by ``nvidia/parakeet-tdt-0.6b-v3``.
+    the TDT wrapper used by Parakeet TDT checkpoints. The v3 checkpoint is
+    published directly in Hugging Face format; v2 needs conversion from NeMo
+    with ``tools/convert_parakeet_tdt_nemo_to_hf.py``.
     """
 
     model_type = "parakeet_tdt"

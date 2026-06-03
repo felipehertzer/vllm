@@ -702,7 +702,7 @@ Speech2Text models trained specifically for Automatic Speech Recognition.
 | `Gemma3nForConditionalGeneration` | Gemma3n | `google/gemma-3n-E2B-it`, `google/gemma-3n-E4B-it`, etc. | | |
 | `GlmAsrForConditionalGeneration` | GLM-ASR | `zai-org/GLM-ASR-Nano-2512` | ✅︎ | ✅︎ |
 | `GraniteSpeechForConditionalGeneration` | Granite Speech | `ibm-granite/granite-4.0-1b-speech`, `ibm-granite/granite-speech-3.3-2b`, etc. | ✅︎ | ✅︎ |
-| `ParakeetForTDT` | NVIDIA Parakeet TDT<sup>†</sup> | `nvidia/parakeet-tdt-0.6b-v3` | | |
+| `ParakeetForTDT` | NVIDIA Parakeet TDT<sup>†</sup> | `nvidia/parakeet-tdt-0.6b-v3`, converted `nvidia/parakeet-tdt-0.6b-v2` | | |
 | `Qwen3ASRForConditionalGeneration` | Qwen3-ASR | `Qwen/Qwen3-ASR-1.7B`, etc. | ✅︎ | ✅︎ |
 | `Qwen3OmniMoeThinkerForConditionalGeneration` | Qwen3-Omni | `Qwen/Qwen3-Omni-30B-A3B-Instruct`, etc. | | ✅︎ |
 | `VoxtralForConditionalGeneration` | Voxtral (Mistral format) | `mistralai/Voxtral-Mini-3B-2507`, `mistralai/Voxtral-Small-24B-2507`, etc. | ✅︎ | ✅︎ |
@@ -712,6 +712,19 @@ Speech2Text models trained specifically for Automatic Speech Recognition.
     `ParakeetForTDT` supports batched transcription requests. Its decoder path
     is request-stateful, so CUDA graph replay and speculative decoding are not
     supported for this model.
+
+    The public `nvidia/parakeet-tdt-0.6b-v2` repository contains only a NeMo
+    `.nemo` archive. Convert it before serving:
+
+    ```bash
+    python tools/convert_parakeet_tdt_nemo_to_hf.py \
+      parakeet-tdt-0.6b-v2.nemo \
+      /path/to/parakeet-tdt-0.6b-v2-hf
+    vllm serve /path/to/parakeet-tdt-0.6b-v2-hf \
+      --max-model-len 512 \
+      --max-num-batched-tokens 512 \
+      --max-num-seqs 1
+    ```
 
     `VoxtralForConditionalGeneration` requires `mistral-common[audio]` to be installed.
 
