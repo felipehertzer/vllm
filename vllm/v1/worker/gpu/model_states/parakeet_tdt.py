@@ -24,6 +24,11 @@ class ParakeetTDTModelState(DefaultModelState):
         self.encoder_outputs: list[torch.Tensor] = []
         self.encoder_output_req_ids: list[str] = []
         self.forced_decoder_sequences: dict[str, list[int]] = {}
+        self.forced_decoder_ids = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            dtype=torch.long,
+            device=device,
+        )
 
     def get_supported_generation_tasks(self):
         return ("transcription",)
@@ -96,7 +101,7 @@ class ParakeetTDTModelState(DefaultModelState):
         self,
         req_ids: list[str],
         num_scheduled_tokens: torch.Tensor | Any,
-        num_computed_tokens: torch.Tensor | Any,
+        output_token_counts: torch.Tensor | Any,
         num_tokens: int,
     ) -> torch.Tensor:
         eos_token_id = int(self.model_config.hf_config.eos_token_id)
@@ -104,7 +109,7 @@ class ParakeetTDTModelState(DefaultModelState):
 
         for req_index, req_id in enumerate(req_ids):
             num_scheduled = int(num_scheduled_tokens[req_index])
-            start_pos = int(num_computed_tokens[req_index])
+            start_pos = int(output_token_counts[req_index])
             sequence = self.forced_decoder_sequences.get(req_id, ())
             for position in range(start_pos, start_pos + num_scheduled):
                 if 0 <= position < len(sequence):
@@ -113,25 +118,35 @@ class ParakeetTDTModelState(DefaultModelState):
                     forced_decoder_ids.append(eos_token_id)
 
         if len(forced_decoder_ids) < num_tokens:
+            pad_token_id = (
+                forced_decoder_ids[-1] if forced_decoder_ids else eos_token_id
+            )
             forced_decoder_ids.extend(
-                [eos_token_id] * (num_tokens - len(forced_decoder_ids))
+                [pad_token_id] * (num_tokens - len(forced_decoder_ids))
             )
 
-        return torch.tensor(
-            forced_decoder_ids[:num_tokens],
-            dtype=torch.long,
-            device=self.device,
+        self.forced_decoder_ids[:num_tokens].copy_(
+            torch.tensor(
+                forced_decoder_ids[:num_tokens],
+                dtype=torch.long,
+                device=self.device,
+            )
         )
+        return self.forced_decoder_ids[:num_tokens]
 
     def prepare_inputs(
         self, input_batch: InputBatch, req_states: RequestState
     ) -> dict[str, torch.Tensor]:
         self._decode_encoder_outputs()
+        output_token_counts = (
+            req_states.total_len.np[input_batch.idx_mapping_np[: input_batch.num_reqs]]
+            - input_batch.prefill_len_np
+        )
         return {
             "forced_decoder_ids": self._build_forced_decoder_ids(
                 input_batch.req_ids,
                 input_batch.num_scheduled_tokens,
-                input_batch.num_computed_tokens_np,
+                output_token_counts,
                 input_batch.num_tokens_after_padding,
             )
         }
@@ -139,10 +154,5 @@ class ParakeetTDTModelState(DefaultModelState):
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         del num_reqs
         eos_token_id = int(self.model_config.hf_config.eos_token_id)
-        forced_decoder_ids = torch.full(
-            (num_tokens,),
-            eos_token_id,
-            dtype=torch.long,
-            device=self.device,
-        )
-        return {"forced_decoder_ids": forced_decoder_ids}
+        self.forced_decoder_ids[:num_tokens].fill_(eos_token_id)
+        return {"forced_decoder_ids": self.forced_decoder_ids[:num_tokens]}

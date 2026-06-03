@@ -469,6 +469,15 @@ class GPUModelRunner(
             model_config, "architectures", ()
         )
         self.parakeet_tdt_forced_decoder_sequences: dict[str, list[int]] = {}
+        self.parakeet_tdt_forced_decoder_ids = (
+            torch.empty(
+                self.max_num_tokens,
+                dtype=torch.long,
+                device=self.device,
+            )
+            if self.is_parakeet_tdt
+            else None
+        )
 
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
@@ -3128,24 +3137,36 @@ class GPUModelRunner(
 
         for req_index, req_id in enumerate(self.input_batch.req_ids):
             num_scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-            start_pos = int(self.input_batch.num_computed_tokens_cpu[req_index])
+            # Parakeet pre-decodes the full transcription once from the encoder
+            # output. The forced sequence is indexed by generated output tokens,
+            # not by vLLM's request-level computed-token counter, which also
+            # includes encoder/prompt bookkeeping for encoder-decoder models.
+            start_pos = len(self.requests[req_id].output_token_ids)
             sequence = self.parakeet_tdt_forced_decoder_sequences.get(req_id, ())
             for position in range(start_pos, start_pos + num_scheduled):
                 if 0 <= position < len(sequence):
-                    forced_decoder_ids.append(sequence[position])
+                    token_id = sequence[position]
                 else:
-                    forced_decoder_ids.append(eos_token_id)
+                    token_id = eos_token_id
+                forced_decoder_ids.append(token_id)
 
         if len(forced_decoder_ids) < num_input_tokens:
+            pad_token_id = (
+                forced_decoder_ids[-1] if forced_decoder_ids else eos_token_id
+            )
             forced_decoder_ids.extend(
-                [eos_token_id] * (num_input_tokens - len(forced_decoder_ids))
+                [pad_token_id] * (num_input_tokens - len(forced_decoder_ids))
             )
 
-        return torch.tensor(
-            forced_decoder_ids[:num_input_tokens],
-            dtype=torch.long,
-            device=self.device,
+        assert self.parakeet_tdt_forced_decoder_ids is not None
+        self.parakeet_tdt_forced_decoder_ids[:num_input_tokens].copy_(
+            torch.tensor(
+                forced_decoder_ids[:num_input_tokens],
+                dtype=torch.long,
+                device=self.device,
+            )
         )
+        return self.parakeet_tdt_forced_decoder_ids[:num_input_tokens]
 
     def _gather_mm_embeddings(
         self,
@@ -5948,11 +5969,12 @@ class GPUModelRunner(
                     num_tokens_across_dp[:] = num_tokens_padded
 
             if self.is_parakeet_tdt:
-                model_kwargs["forced_decoder_ids"] = torch.full(
-                    (num_tokens_padded,),
-                    int(self.model_config.hf_config.eos_token_id),
-                    dtype=torch.long,
-                    device=self.device,
+                assert self.parakeet_tdt_forced_decoder_ids is not None
+                self.parakeet_tdt_forced_decoder_ids[:num_tokens_padded].fill_(
+                    int(self.model_config.hf_config.eos_token_id)
+                )
+                model_kwargs["forced_decoder_ids"] = (
+                    self.parakeet_tdt_forced_decoder_ids[:num_tokens_padded]
                 )
 
             with (

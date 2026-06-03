@@ -16,6 +16,7 @@ from vllm.model_executor.models.parakeet_tdt import (
     ParakeetTDTModel,
 )
 from vllm.transformers_utils.configs.parakeet_tdt import ParakeetTDTConfig
+from vllm.v1.worker.gpu.model_states.parakeet_tdt import ParakeetTDTModelState
 
 
 def test_parakeet_tdt_forced_tokens_follow_positions():
@@ -119,6 +120,57 @@ def test_parakeet_tdt_forward_decodes_multiple_encoder_outputs():
     )
 
     assert logits.argmax(dim=-1).tolist() == [11, 21]
+
+
+def test_parakeet_tdt_model_state_forces_tokens_from_output_count():
+    model_state = ParakeetTDTModelState.__new__(ParakeetTDTModelState)
+    model_state.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(eos_token_id=99)
+    )
+    model_state.device = torch.device("cpu")
+    model_state.forced_decoder_sequences = {"req": [11, 12, 13, 99]}
+    model_state.forced_decoder_ids = torch.empty(4, dtype=torch.long)
+
+    forced = ParakeetTDTModelState._build_forced_decoder_ids(
+        model_state,
+        req_ids=["req"],
+        num_scheduled_tokens=torch.tensor([1]),
+        output_token_counts=torch.tensor([2]),
+        num_tokens=1,
+    )
+
+    assert forced.tolist() == [13]
+
+
+def test_parakeet_tdt_model_state_reuses_forced_token_buffer():
+    model_state = ParakeetTDTModelState.__new__(ParakeetTDTModelState)
+    model_state.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(eos_token_id=99)
+    )
+    model_state.device = torch.device("cpu")
+    model_state.forced_decoder_sequences = {"req": [11, 12, 13, 99]}
+    model_state.forced_decoder_ids = torch.empty(4, dtype=torch.long)
+
+    first = ParakeetTDTModelState._build_forced_decoder_ids(
+        model_state,
+        req_ids=["req"],
+        num_scheduled_tokens=torch.tensor([1]),
+        output_token_counts=torch.tensor([1]),
+        num_tokens=4,
+    )
+    first_data_ptr = first.data_ptr()
+
+    second = ParakeetTDTModelState._build_forced_decoder_ids(
+        model_state,
+        req_ids=["req"],
+        num_scheduled_tokens=torch.tensor([1]),
+        output_token_counts=torch.tensor([2]),
+        num_tokens=4,
+    )
+
+    assert first.tolist() == [12, 12, 12, 12]
+    assert second.tolist() == [13, 13, 13, 13]
+    assert second.data_ptr() == first_data_ptr
 
 
 def test_parakeet_tdt_config_updates_runtime_metadata():
