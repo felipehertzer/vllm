@@ -1100,6 +1100,12 @@ class NemotronASRForRNNT(
     def get_language_model(self) -> nn.Module:
         return self.model.decoder
 
+    @staticmethod
+    def get_model_state_cls():
+        from vllm.v1.worker.gpu.model_states.nemotron_asr import NemotronASRModelState
+
+        return NemotronASRModelState
+
     @classmethod
     def validate_language(cls, language: str | None) -> str | None:
         if language in (None, "auto"):

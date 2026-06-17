@@ -1,12 +1,25 @@
 # CUDA architecture lists — following PyTorch RELEASE.md
 # (https://github.com/pytorch/pytorch/blob/main/RELEASE.md)
 # SM86 included for broader Ampere coverage; SM89 for marlin fp8 support
+# These requested arches are filtered by CMake's CUDA_SUPPORTED_ARCHS before
+# per-kernel arch selection. Do not add +PTX here: top-level +PTX is stripped
+# during that filtering, so kernels that need PTX must request it locally.
 env:
-  CUDA_ARCH_X86: "7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX"
-  # aarch64 only architectures: 8.7 for Orin, 11.0 for Thor (since CUDA 13)
-  CUDA_ARCH_AARCH64: "8.0 8.7 8.9 9.0 10.0 11.0 12.0+PTX"
+  # for CUDA >=13, sm_100+ targets have family specifiers (see CMakeLists.txt)
+  # so targets like 10.3 and 12.1 are automatically supported with this list
+  CUDA_ARCH_X86: "7.5 8.0 8.6 8.9 9.0 10.0 12.0"
+  # aarch64-only targets: Orin (8.7), Thor (11.0, CUDA 13+)
+  CUDA_ARCH_AARCH64: "8.0 8.7 8.9 9.0 10.0 11.0 12.0"
+
+  # for CUDA <13, we need to specify all needed targets
+  # some targets (10.3, 12.1) are skipped to limit the wheel size (< 500MB)
+  # please use CUDA 13 wheels or compile yourself on these new devices
   CUDA_ARCH_X86_CU129: "7.5 8.0 8.6 8.9 9.0 10.0 12.0"
   CUDA_ARCH_AARCH64_CU129: "8.0 8.7 8.9 9.0 10.0 12.0"
+
+  # pre-built mooncake wheels
+  # the manylinux_2_35 wheel has compatibility issue on Ubuntu 24.04
+  # so we use different wheels for the time being
   MOONCAKE_WHEEL_AARCH64_2_35: "https://vllm-wheels.s3.amazonaws.com/mooncake/mooncake_transfer_engine-0.3.10.post2-0da9dfea3-cp312-cp312-manylinux_2_35_aarch64.whl"
   MOONCAKE_WHEEL_AARCH64_2_39: "https://vllm-wheels.s3.amazonaws.com/mooncake/mooncake_transfer_engine-0.3.10.post2-0da9dfea3-cp312-cp312-manylinux_2_39_aarch64.whl"
   MOONCAKE_WHEEL_X86_64: "https://vllm-wheels.s3.amazonaws.com/mooncake/mooncake_transfer_engine-0.3.10.post2-0da9dfea3-cp312-cp312-manylinux_2_35_x86_64.whl"
@@ -501,21 +514,21 @@ steps:
         echo "  CACHE_KEY: $${CACHE_KEY}"
         echo "  ECR_CACHE_TAG: $${ECR_CACHE_TAG}"
         echo "========================================"
-        
+
         # Login to ECR
         aws ecr-public get-login-password --region us-east-1 | \
           docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7
-        
+
         IMAGE_EXISTS=false
         WHEELS_EXIST=false
-        
+
         # Check ECR for Docker image
 
         if docker manifest inspect "$${ECR_CACHE_TAG}" > /dev/null 2>&1; then
           IMAGE_EXISTS=true
           echo "ECR image cache HIT"
         fi
-        
+
         # Check S3 for wheels
         WHEEL_CACHE_STATUS=$(.buildkite/scripts/cache-rocm-base-wheels.sh check)
         if [ "$${WHEEL_CACHE_STATUS}" = "hit" ]; then
@@ -523,7 +536,7 @@ steps:
           echo "S3 wheels cache HIT"
         fi
 
-        
+
         # Scenario 1: Both cached (best case)
         if [ "$${IMAGE_EXISTS}" = "true" ] && [ "$${WHEELS_EXIST}" = "true" ]; then
           echo ""
@@ -532,16 +545,16 @@ steps:
 
           # Download wheels
           .buildkite/scripts/cache-rocm-base-wheels.sh download
-          
+
           # Save ECR tag for downstream jobs
           buildkite-agent meta-data set "rocm-base-image-tag" "$${ECR_CACHE_TAG}"
-          
+
         # Scenario 2: Full rebuild needed
         else
           echo ""
           echo " CACHE MISS - Building from scratch..."
           echo ""
-          
+
           # Build full base image and push to ECR
           DOCKER_BUILDKIT=1 docker buildx build \
             --file docker/Dockerfile.rocm_base \
@@ -552,7 +565,7 @@ steps:
             --build-arg SCCACHE_S3_NO_CREDENTIALS=0 \
             --push \
             .
-          
+
           # Build wheel extraction stage
           DOCKER_BUILDKIT=1 docker buildx build \
             --file docker/Dockerfile.rocm_base \
@@ -564,20 +577,20 @@ steps:
             --build-arg SCCACHE_S3_NO_CREDENTIALS=0 \
             --load \
             .
-          
+
           # Extract and upload wheels
           mkdir -p artifacts/rocm-base-wheels
           cid=$(docker create rocm-base-debs:$${BUILDKITE_BUILD_NUMBER})
           docker cp $${cid}:/app/debs/. artifacts/rocm-base-wheels/
           docker rm $${cid}
-          
+
           .buildkite/scripts/cache-rocm-base-wheels.sh upload
 
           # Cache base docker image to ECR
           docker push "$${ECR_CACHE_TAG}"
-          
+
           buildkite-agent meta-data set "rocm-base-image-tag" "$${ECR_CACHE_TAG}"
-          
+
           echo ""
           echo " Build complete - Image and wheels cached"
         fi
@@ -606,7 +619,7 @@ steps:
         # This fixes version detection when tags are moved/force-pushed
         echo "Fetching latest tags from origin..."
         git fetch --tags --force origin
-        
+
         # Log tag information for debugging version detection
         echo "========================================"
         echo "Git Tag Verification"
@@ -632,18 +645,18 @@ steps:
           echo "This should have been set by the build-rocm-base-wheels job"
           exit 1
         fi
-        
+
         echo "Pulling base Docker image from ECR: $${ECR_IMAGE_TAG}"
-        
+
         # Login to ECR
         aws ecr-public get-login-password --region us-east-1 | \
           docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7
-        
+
         # Pull base Docker image from ECR
         docker pull "$${ECR_IMAGE_TAG}"
-        
+
         echo "Loaded base image: $${ECR_IMAGE_TAG}"
-        
+
         # Prepare base wheels for Docker build context
         mkdir -p docker/context/base-wheels
         touch docker/context/base-wheels/.keep
@@ -753,11 +766,11 @@ steps:
     commands:
       - |
         set -euo pipefail
-        
+
         # Login to ECR
         aws ecr-public get-login-password --region us-east-1 | \
           docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7
-        
+
         # Get ECR image tag from metadata (set by build-rocm-base-wheels)
         ECR_IMAGE_TAG="$$(buildkite-agent meta-data get rocm-base-image-tag 2>/dev/null || echo '')"
         if [ -z "$${ECR_IMAGE_TAG}" ]; then
@@ -765,23 +778,23 @@ steps:
           echo "This should have been set by the build-rocm-base-wheels job"
           exit 1
         fi
-        
+
         echo "Pulling base Docker image from ECR: $${ECR_IMAGE_TAG}"
-        
+
         # Pull base Docker image from ECR
         docker pull "$${ECR_IMAGE_TAG}"
-        
+
         echo "Loaded base image: $${ECR_IMAGE_TAG}"
-        
+
         # Pass the base image ECR tag to downstream steps (nightly publish)
         buildkite-agent meta-data set "rocm-base-ecr-tag" "$${ECR_IMAGE_TAG}"
-        
+
         echo "========================================"
         echo "Building vLLM ROCm release image with:"
         echo "  BASE_IMAGE: $${ECR_IMAGE_TAG}"
         echo "  BUILDKITE_COMMIT: $${BUILDKITE_COMMIT}"
         echo "========================================"
-        
+
         # Build vLLM ROCm release image using cached base
         DOCKER_BUILDKIT=1 docker build \
           --build-arg max_jobs=16 \
@@ -794,7 +807,7 @@ steps:
           --target vllm-openai \
           --progress plain \
           -f docker/Dockerfile.rocm .
-        
+
         # Push to ECR
         docker push public.ecr.aws/q9t5s3a7/vllm-release-repo:$${BUILDKITE_COMMIT}-rocm
 
@@ -846,7 +859,6 @@ steps:
         allow_failure: true
       - step: build-cpu-release-image-arm64
         allow_failure: true
-    if: build.env("NIGHTLY") != "1"
 
   - label: "Publish release images to DockerHub"
     depends_on:

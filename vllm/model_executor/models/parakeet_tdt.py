@@ -439,6 +439,12 @@ class ParakeetForTDT(nn.Module, SupportsTranscription, SupportsMultiModal):
     def get_language_model(self) -> nn.Module:
         return self.model.decoder
 
+    @staticmethod
+    def get_model_state_cls():
+        from vllm.v1.worker.gpu.model_states.parakeet_tdt import ParakeetTDTModelState
+
+        return ParakeetTDTModelState
+
     def _parse_and_validate_audio_input(
         self,
         **kwargs: object,
