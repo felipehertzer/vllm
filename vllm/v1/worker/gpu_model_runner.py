@@ -476,17 +476,21 @@ class GPUModelRunner(
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
-        self.is_parakeet_tdt = "ParakeetForTDT" in getattr(
-            model_config, "architectures", ()
+        self.is_transducer_asr = bool(
+            {"ParakeetForTDT", "NemotronASRForRNNT"}
+            & set(getattr(model_config, "architectures", ()))
         )
-        self.parakeet_tdt_forced_decoder_sequences: dict[str, list[int]] = {}
-        self.parakeet_tdt_forced_decoder_ids = (
+        self.transducer_asr_uses_prompt_ids = "NemotronASRForRNNT" in set(
+            getattr(model_config, "architectures", ())
+        )
+        self.transducer_asr_forced_decoder_sequences: dict[str, list[int]] = {}
+        self.transducer_asr_forced_decoder_ids = (
             torch.empty(
                 self.max_num_tokens,
                 dtype=torch.long,
                 device=self.device,
             )
-            if self.is_parakeet_tdt
+            if self.is_transducer_asr
             else None
         )
 
@@ -1156,7 +1160,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
-            self.parakeet_tdt_forced_decoder_sequences.pop(req_id, None)
+            self.transducer_asr_forced_decoder_sequences.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1346,9 +1350,9 @@ class GPUModelRunner(
                         )
 
                     if is_ngram_gpu and optimistic_num_accepted > 0:
-                        self.input_batch.num_tokens_no_spec[req_index] += (
-                            optimistic_num_accepted
-                        )
+                        self.input_batch.num_tokens_no_spec[
+                            req_index
+                        ] += optimistic_num_accepted
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
@@ -1502,9 +1506,9 @@ class GPUModelRunner(
                     cur_req_index = self.input_batch.req_id_to_index.get(req_id)
                     if cur_req_index is None:
                         continue
-                    self.input_batch.num_computed_tokens_cpu[cur_req_index] -= (
-                        correction
-                    )
+                    self.input_batch.num_computed_tokens_cpu[
+                        cur_req_index
+                    ] -= correction
                     if is_ngram_gpu and correction > 0:
                         self.input_batch.num_tokens_no_spec[cur_req_index] -= correction
                         self.num_tokens_no_spec_gpu[cur_req_index] -= correction
@@ -1609,9 +1613,9 @@ class GPUModelRunner(
     def _init_mrope_positions(self, req_state: CachedRequestState):
         model = self.get_model()
         assert supports_mrope(model), "M-RoPE support is not implemented."
-        assert req_state.prompt_token_ids is not None, (
-            "M-RoPE requires prompt_token_ids to be available."
-        )
+        assert (
+            req_state.prompt_token_ids is not None
+        ), "M-RoPE requires prompt_token_ids to be available."
         mrope_model = cast(SupportsMRoPE, model)
 
         # `prompt_embeds` is a passthrough modality (no grid_thw), models'
@@ -1630,9 +1634,9 @@ class GPUModelRunner(
     def _init_xdrope_positions(self, req_state: CachedRequestState):
         model = self.get_model()
         xdrope_model = cast(SupportsXDRoPE, model)
-        assert req_state.prompt_token_ids is not None, (
-            "XD-RoPE requires prompt_token_ids to be available."
-        )
+        assert (
+            req_state.prompt_token_ids is not None
+        ), "XD-RoPE requires prompt_token_ids to be available."
         assert supports_xdrope(model), "XD-RoPE support is not implemented."
 
         req_state.xdrope_positions = xdrope_model.get_xdrope_input_positions(
@@ -3102,7 +3106,7 @@ class GPUModelRunner(
 
         return encoder_outputs
 
-    def _get_parakeet_tdt_encoder_output_req_ids(
+    def _get_transducer_asr_encoder_output_req_ids(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> list[str]:
@@ -3119,7 +3123,7 @@ class GPUModelRunner(
                 req_ids.append(req_id)
         return req_ids
 
-    def _decode_parakeet_tdt_encoder_outputs(
+    def _decode_transducer_asr_encoder_outputs(
         self,
         scheduler_output: "SchedulerOutput",
         encoder_outputs: Sequence[torch.Tensor],
@@ -3127,32 +3131,59 @@ class GPUModelRunner(
         if not encoder_outputs:
             return
 
-        req_ids = self._get_parakeet_tdt_encoder_output_req_ids(scheduler_output)
+        req_ids = self._get_transducer_asr_encoder_output_req_ids(scheduler_output)
         if len(req_ids) != len(encoder_outputs):
             raise ValueError(
-                "Parakeet TDT encoder output count does not match scheduled "
+                "Transducer ASR encoder output count does not match scheduled "
                 f"request count: {len(encoder_outputs)} != {len(req_ids)}."
             )
 
-        profile = _parakeet_profile_enabled()
+        profile = _parakeet_profile_enabled() or os.getenv(
+            "NEMOTRON_ASR_PROFILE", ""
+        ).lower() in {"1", "true", "yes", "on"}
         if profile:
             _sync_if_cuda(self.device)
             started_at = time.perf_counter()
-        sequences = self.model.model.greedy_decode_batch(encoder_outputs)
+        if self.transducer_asr_uses_prompt_ids:
+            hf_config = self.model_config.hf_config
+            default_prompt_id = int(hf_config.prompt_id_for_language(None))
+            prompt_ids = torch.tensor(
+                [
+                    int(
+                        (
+                            getattr(
+                                self.requests[req_id].sampling_params,
+                                "extra_args",
+                                None,
+                            )
+                            or {}
+                        ).get("transducer_asr_prompt_id", default_prompt_id)
+                    )
+                    for req_id in req_ids
+                ],
+                dtype=torch.long,
+                device=self.device,
+            )
+            sequences = self.model.model.greedy_decode_batch(
+                encoder_outputs,
+                prompt_ids=prompt_ids,
+            )
+        else:
+            sequences = self.model.model.greedy_decode_batch(encoder_outputs)
         if profile:
             _sync_if_cuda(self.device)
-            tdt_decode_ms = (time.perf_counter() - started_at) * 1000
+            decode_ms = (time.perf_counter() - started_at) * 1000
             output_tokens = sum(len(sequence) for sequence in sequences)
             logger.info(
-                "Parakeet profile tdt_decode_ms=%.2f chunks=%d output_tokens=%d",
-                tdt_decode_ms,
+                "Transducer ASR profile decode_ms=%.2f chunks=%d output_tokens=%d",
+                decode_ms,
                 len(encoder_outputs),
                 output_tokens,
             )
         for req_id, sequence in zip(req_ids, sequences, strict=True):
-            self.parakeet_tdt_forced_decoder_sequences[req_id] = sequence
+            self.transducer_asr_forced_decoder_sequences[req_id] = sequence
 
-    def _get_parakeet_tdt_forced_decoder_ids(
+    def _get_transducer_asr_forced_decoder_ids(
         self,
         scheduler_output: "SchedulerOutput",
         num_input_tokens: int,
@@ -3162,12 +3193,12 @@ class GPUModelRunner(
 
         for req_index, req_id in enumerate(self.input_batch.req_ids):
             num_scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-            # Parakeet pre-decodes the full transcription once from the encoder
+            # Transducer ASR pre-decodes the transcription once from the encoder
             # output. The forced sequence is indexed by generated output tokens,
             # not by vLLM's request-level computed-token counter, which also
             # includes encoder/prompt bookkeeping for encoder-decoder models.
             start_pos = len(self.requests[req_id].output_token_ids)
-            sequence = self.parakeet_tdt_forced_decoder_sequences.get(req_id, ())
+            sequence = self.transducer_asr_forced_decoder_sequences.get(req_id, ())
             for position in range(start_pos, start_pos + num_scheduled):
                 if 0 <= position < len(sequence):
                     token_id = sequence[position]
@@ -3183,15 +3214,15 @@ class GPUModelRunner(
                 [pad_token_id] * (num_input_tokens - len(forced_decoder_ids))
             )
 
-        assert self.parakeet_tdt_forced_decoder_ids is not None
-        self.parakeet_tdt_forced_decoder_ids[:num_input_tokens].copy_(
+        assert self.transducer_asr_forced_decoder_ids is not None
+        self.transducer_asr_forced_decoder_ids[:num_input_tokens].copy_(
             torch.tensor(
                 forced_decoder_ids[:num_input_tokens],
                 dtype=torch.long,
                 device=self.device,
             )
         )
-        return self.parakeet_tdt_forced_decoder_ids[:num_input_tokens]
+        return self.transducer_asr_forced_decoder_ids[:num_input_tokens]
 
     def _gather_mm_embeddings(
         self,
@@ -3448,9 +3479,9 @@ class GPUModelRunner(
         kv_connector_output: KVConnectorOutput | None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         num_reqs = self.input_batch.num_reqs
-        assert num_reqs == len(self.input_batch.pooling_params), (
-            "Either all or none of the requests in a batch must be pooling request"
-        )
+        assert num_reqs == len(
+            self.input_batch.pooling_params
+        ), "Either all or none of the requests in a batch must be pooling request"
 
         hidden_states = hidden_states[:num_scheduled_tokens]
         seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs]
@@ -3629,16 +3660,16 @@ class GPUModelRunner(
             # simpler, because the outputs are just passed to the decoder.
             # We are not doing any prompt replacement.
             encoder_outputs = self._execute_mm_encoder(scheduler_output)
-            if self.is_parakeet_tdt:
-                self._decode_parakeet_tdt_encoder_outputs(
+            if self.is_transducer_asr:
+                self._decode_transducer_asr_encoder_outputs(
                     scheduler_output, encoder_outputs
                 )
             else:
                 model_kwargs.update({"encoder_outputs": encoder_outputs})
 
-        if self.is_parakeet_tdt:
+        if self.is_transducer_asr:
             model_kwargs["forced_decoder_ids"] = (
-                self._get_parakeet_tdt_forced_decoder_ids(
+                self._get_transducer_asr_forced_decoder_ids(
                     scheduler_output,
                     num_input_tokens,
                 )
@@ -4328,9 +4359,11 @@ class GPUModelRunner(
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-                num_tokens_padded=num_tokens_padded
-                if pad_attn or has_separate_kv_update
-                else num_tokens_unpadded,
+                num_tokens_padded=(
+                    num_tokens_padded
+                    if pad_attn or has_separate_kv_update
+                    else num_tokens_unpadded
+                ),
                 num_reqs_padded=(
                     num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
                 ),
@@ -4700,9 +4733,9 @@ class GPUModelRunner(
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 kv_connector_output=kv_connector_output,
-                ec_connector_output=ec_connector_output
-                if self.supports_mm_inputs
-                else None,
+                ec_connector_output=(
+                    ec_connector_output if self.supports_mm_inputs else None
+                ),
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
@@ -4774,9 +4807,9 @@ class GPUModelRunner(
         pp = get_pp_group()
         assert pp.is_last_rank
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
-        assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
-            "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
-        )
+        assert (
+            sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1
+        ), "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
         # Skip for chunked prefill: sampled tokens are dummy
         # and will be discarded, no need to broadcast.
         if not self._is_all_reqs_chunked_prefill():
@@ -5016,9 +5049,9 @@ class GPUModelRunner(
             else:
                 indices = []
                 offset = 0
-                assert spec_decode_metadata is not None, (
-                    "No spec decode metadata for medusa"
-                )
+                assert (
+                    spec_decode_metadata is not None
+                ), "No spec decode metadata for medusa"
                 for num_draft, tokens in zip(
                     spec_decode_metadata.num_draft_tokens, sampled_token_ids
                 ):
@@ -5246,9 +5279,9 @@ class GPUModelRunner(
                         and is_mixture_of_experts(self.drafter.model)
                         and self.parallel_config.enable_eplb
                     ):
-                        assert not self.parallel_config.enable_elastic_ep, (
-                            "Elastic EP is not supported with drafter model."
-                        )
+                        assert (
+                            not self.parallel_config.enable_elastic_ep
+                        ), "Elastic EP is not supported with drafter model."
                         spec_config = self.vllm_config.speculative_config
                         assert spec_config is not None
                         assert spec_config.draft_model_config is not None
@@ -5993,13 +6026,13 @@ class GPUModelRunner(
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
 
-            if self.is_parakeet_tdt:
-                assert self.parakeet_tdt_forced_decoder_ids is not None
-                self.parakeet_tdt_forced_decoder_ids[:num_tokens_padded].fill_(
+            if self.is_transducer_asr:
+                assert self.transducer_asr_forced_decoder_ids is not None
+                self.transducer_asr_forced_decoder_ids[:num_tokens_padded].fill_(
                     int(self.model_config.hf_config.eos_token_id)
                 )
                 model_kwargs["forced_decoder_ids"] = (
-                    self.parakeet_tdt_forced_decoder_ids[:num_tokens_padded]
+                    self.transducer_asr_forced_decoder_ids[:num_tokens_padded]
                 )
 
             with (
@@ -6921,12 +6954,16 @@ class GPUModelRunner(
                 attn_group.create_metadata_builders(
                     self.vllm_config,
                     self.device,
-                    kernel_block_sizes[kv_cache_group_id]
-                    if kv_cache_group_id < len(kernel_block_sizes)
-                    else None,
-                    num_metadata_builders=1
-                    if not self.parallel_config.use_ubatching
-                    else self.parallel_config.num_ubatches,
+                    (
+                        kernel_block_sizes[kv_cache_group_id]
+                        if kv_cache_group_id < len(kernel_block_sizes)
+                        else None
+                    ),
+                    num_metadata_builders=(
+                        1
+                        if not self.parallel_config.use_ubatching
+                        else self.parallel_config.num_ubatches
+                    ),
                 )
         # Calculate reorder batch threshold (if needed)
         # Note (tdoublep): do this *after* constructing builders,
@@ -7152,9 +7189,9 @@ class GPUModelRunner(
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 layer_names.add(layer_name)
-        assert layer_names == set(kv_cache_raw_tensors.keys()), (
-            "Some layers are not correctly initialized"
-        )
+        assert layer_names == set(
+            kv_cache_raw_tensors.keys()
+        ), "Some layers are not correctly initialized"
         return kv_cache_raw_tensors
 
     def _attn_group_iterator(self) -> Iterator[AttentionGroup]:
@@ -7558,9 +7595,9 @@ class GPUModelRunner(
                 encoder_only_attn_specs[attn_spec].append(layer_name)
                 self.runner_only_attn_layers.add(layer_name)
         if len(encoder_only_attn_specs) > 0:
-            assert len(encoder_only_attn_specs) == 1, (
-                "Only support one encoder-only attention spec now"
-            )
+            assert (
+                len(encoder_only_attn_specs) == 1
+            ), "Only support one encoder-only attention spec now"
             spec, layer_names = encoder_only_attn_specs.popitem()
             self.kv_cache_config.kv_cache_groups.append(
                 KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)

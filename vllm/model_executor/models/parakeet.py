@@ -226,6 +226,8 @@ class ParakeetExtractor:
             < features_lengths[:, None]
         )
         mask = attention_mask.unsqueeze(-1)
+        if self.config.normalize == "NA":
+            return mel_features * mask, attention_mask
         lengths = attention_mask.sum(dim=1)
         mel_features_masked = mel_features * mask
         mean = (mel_features_masked.sum(dim=1) / lengths.unsqueeze(-1)).unsqueeze(1)

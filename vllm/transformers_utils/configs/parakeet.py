@@ -53,11 +53,19 @@ class ExtractorConfig:
     preemphasis: float = 0.97
     n_fft: int = 512
     padding_value: float = 0.0
+    normalize: str = "per_feature"
 
     @classmethod
     def from_hf_config(cls, config: PretrainedConfig) -> "ExtractorConfig":
         assert isinstance(config, PretrainedConfig)
-        defaults = ("hop_length", "win_length", "preemphasis", "n_fft", "padding_value")
+        defaults = (
+            "hop_length",
+            "win_length",
+            "preemphasis",
+            "n_fft",
+            "padding_value",
+            "normalize",
+        )
         optional_kwargs = {
             name: getattr(config, name) for name in defaults if hasattr(config, name)
         }

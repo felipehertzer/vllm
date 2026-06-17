@@ -52,6 +52,7 @@ from vllm.transformers_utils.model_arch_config_convertor import (
     MODEL_ARCH_CONFIG_CONVERTORS,
     ModelArchConfigConvertorBase,
 )
+from vllm.transformers_utils.nemotron_asr import maybe_prepare_nemotron_asr_model
 from vllm.transformers_utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from vllm.transformers_utils.utils import maybe_model_redirect
 from vllm.utils.import_utils import LazyLoader
@@ -490,6 +491,11 @@ class ModelConfig:
             self.model, self.served_model_name
         )
         self.model = maybe_model_redirect(self.model)
+        self.model = maybe_prepare_nemotron_asr_model(
+            self.model,
+            revision=self.revision,
+            token=self.hf_token,
+        )
         # The tokenizer is consistent with the model by default.
         if self.tokenizer is None:
             self.tokenizer = self.model

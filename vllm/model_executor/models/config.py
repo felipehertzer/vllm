@@ -499,6 +499,16 @@ class ParakeetForTDTConfig(VerifyAndUpdateConfig):
         )
 
 
+class NemotronASRForRNNTConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        model_config = vllm_config.model_config
+
+        model_config.override_generation_config.setdefault(
+            "eos_token_id", model_config.hf_config.eos_token_id
+        )
+
+
 class Qwen2ForProcessRewardModelConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -622,6 +632,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "MambaForCausalLM": MambaModelConfig,
     "NemotronHForCausalLM": NemotronHForCausalLMConfig,
     "NemotronHPuzzleForCausalLM": NemotronHForCausalLMConfig,
+    "NemotronASRForRNNT": NemotronASRForRNNTConfig,
     "NemotronH_Nano_VL_V2": NemotronHNanoVLV2Config,
     "NomicBertModel": NomicBertModelConfig,
     "ParakeetForTDT": ParakeetForTDTConfig,

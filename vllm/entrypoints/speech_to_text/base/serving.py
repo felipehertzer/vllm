@@ -74,8 +74,15 @@ ResponseType: TypeAlias = (
 logger = init_logger(__name__)
 
 
-def _parakeet_profile_enabled() -> bool:
-    return os.getenv("PARAKEET_PROFILE", "").lower() in {"1", "true", "yes", "on"}
+def _transducer_asr_profile_enabled() -> bool:
+    return any(
+        os.getenv(env_name, "").lower() in {"1", "true", "yes", "on"}
+        for env_name in (
+            "PARAKEET_PROFILE",
+            "NEMOTRON_ASR_PROFILE",
+            "TRANSDUCER_ASR_PROFILE",
+        )
+    )
 
 
 def asr_inter_chunk_separator(
@@ -506,6 +513,20 @@ class OpenAISpeechToText(OpenAIServing):
         if request.response_format == "verbose_json":
             sampling_params.logprobs = 1
 
+        update_sampling_params = getattr(
+            self.model_cls,
+            "update_speech_to_text_sampling_params",
+            None,
+        )
+        if update_sampling_params is not None and isinstance(
+            sampling_params, SamplingParams
+        ):
+            update_sampling_params(
+                sampling_params=sampling_params,
+                model_config=self.model_config,
+                language=request.language,
+            )
+
         engine_request_ids = [
             request_id if len(engine_inputs) == 1 else f"{request_id}-{idx}"
             for idx in range(len(engine_inputs))
@@ -561,9 +582,9 @@ class OpenAISpeechToText(OpenAIServing):
         )
 
         if request.stream:
-            if _parakeet_profile_enabled():
+            if _transducer_asr_profile_enabled():
                 logger.info(
-                    "Parakeet STT profile request_id=%s audio_decode_ms=%.2f "
+                    "Transducer ASR STT profile request_id=%s audio_decode_ms=%.2f "
                     "chunks=%d duration_s=%.2f stream=True",
                     request_id,
                     audio_decode_ms,
@@ -592,9 +613,9 @@ class OpenAISpeechToText(OpenAIServing):
             segment_class: type[SpeechToTextSegment] = segments_types[self.task_type]
             chunk_size_in_s = self.asr_config.max_audio_clip_s
             if chunk_size_in_s is None:
-                assert len(list_result_generator) == 1, (
-                    "`max_audio_clip_s` is set to None, audio cannot be chunked"
-                )
+                assert (
+                    len(list_result_generator) == 1
+                ), "`max_audio_clip_s` is set to None, audio cannot be chunked"
             result_generator = merge_async_iterators(*list_result_generator)
             async for idx, op in result_generator:
                 start_time = (
@@ -660,10 +681,10 @@ class OpenAISpeechToText(OpenAIServing):
                             segments=total_segments,
                         ),
                     )
-            if _parakeet_profile_enabled():
+            if _transducer_asr_profile_enabled():
                 total_ms = (time.perf_counter() - request_started_at) * 1000
                 logger.info(
-                    "Parakeet STT profile request_id=%s audio_decode_ms=%.2f "
+                    "Transducer ASR STT profile request_id=%s audio_decode_ms=%.2f "
                     "total_ms=%.2f chunks=%d duration_s=%.2f",
                     request_id,
                     audio_decode_ms,
@@ -692,10 +713,13 @@ class OpenAISpeechToText(OpenAIServing):
         request_metadata: RequestResponseMetadata,
         audio_duration_s: float,
         chunk_object_type: Literal["translation.chunk", "transcription.chunk"],
-        response_stream_choice_class: type[TranscriptionResponseStreamChoice]
-        | type[TranslationResponseStreamChoice],
-        stream_response_class: type[TranscriptionStreamResponse]
-        | type[TranslationStreamResponse],
+        response_stream_choice_class: (
+            type[TranscriptionResponseStreamChoice]
+            | type[TranslationResponseStreamChoice]
+        ),
+        stream_response_class: (
+            type[TranscriptionStreamResponse] | type[TranslationStreamResponse]
+        ),
         separator: str,
     ) -> AsyncGenerator[str, None]:
         created_time = int(time.time())

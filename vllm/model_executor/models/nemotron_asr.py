@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Inference-only NVIDIA Parakeet TDT model."""
+"""Inference-only NVIDIA Nemotron 3.5 ASR RNN-T model."""
 
-from collections.abc import Iterable, Mapping, Sequence
+from __future__ import annotations
+
+import asyncio
+import math
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import ParakeetEncoder
 from transformers.feature_extraction_utils import BatchFeature
 
@@ -25,6 +30,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
+    SupportsRealtime,
     SupportsTranscription,
 )
 from vllm.model_executor.models.parakeet import ParakeetExtractor
@@ -33,6 +39,7 @@ from vllm.model_executor.models.transducer_asr import (
     TransducerDecodeConfig,
     TransducerPredictionDecoder,
     greedy_decode_transducer_batch,
+    strip_asr_special_tokens,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -50,42 +57,54 @@ from vllm.multimodal.processing import (
     PromptUpdate,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.configs.parakeet_tdt import ParakeetTDTConfig
+from vllm.transformers_utils.configs.nemotron_asr import (
+    NEMOTRON_ASR_LANGUAGE_ALIASES,
+    NemotronASRConfig,
+)
 
 logger = init_logger(__name__)
 
-PARAKEET_SUPPORTED_LANGUAGES = {
+NEMOTRON_ASR_SUPPORTED_LANGUAGES = {
+    "ar": "Arabic",
     "bg": "Bulgarian",
-    "hr": "Croatian",
     "cs": "Czech",
     "da": "Danish",
-    "nl": "Dutch",
+    "de": "German",
+    "el": "Greek",
     "en": "English",
+    "es": "Spanish",
     "et": "Estonian",
     "fi": "Finnish",
     "fr": "French",
-    "de": "German",
-    "el": "Greek",
+    "he": "Hebrew",
+    "hi": "Hindi",
+    "hr": "Croatian",
     "hu": "Hungarian",
     "it": "Italian",
-    "lv": "Latvian",
+    "ja": "Japanese",
+    "ko": "Korean",
     "lt": "Lithuanian",
+    "lv": "Latvian",
     "mt": "Maltese",
+    "nl": "Dutch",
     "pl": "Polish",
     "pt": "Portuguese",
     "ro": "Romanian",
+    "ru": "Russian",
     "sk": "Slovak",
     "sl": "Slovenian",
-    "es": "Spanish",
     "sv": "Swedish",
-    "ru": "Russian",
+    "th": "Thai",
+    "tr": "Turkish",
     "uk": "Ukrainian",
+    "vi": "Vietnamese",
+    "zh": "Chinese",
 }
 
 
-class ParakeetTDTProcessingInfo(BaseProcessingInfo):
-    def get_hf_config(self) -> ParakeetTDTConfig:
-        return self.ctx.get_hf_config(ParakeetTDTConfig)
+class NemotronASRProcessingInfo(BaseProcessingInfo):
+    def get_hf_config(self) -> NemotronASRConfig:
+        return self.ctx.get_hf_config(NemotronASRConfig)
 
     def get_feature_extractor(self) -> ParakeetExtractor:
         return ParakeetExtractor(self.get_hf_config().encoder_config)
@@ -104,7 +123,7 @@ class ParakeetTDTProcessingInfo(BaseProcessingInfo):
         return self.get_feature_extractor().audio_token_count(num_samples)
 
 
-class ParakeetTDTDummyInputsBuilder(BaseDummyInputsBuilder[ParakeetTDTProcessingInfo]):
+class NemotronASRDummyInputsBuilder(BaseDummyInputsBuilder[NemotronASRProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         return ""
 
@@ -127,8 +146,8 @@ class ParakeetTDTDummyInputsBuilder(BaseDummyInputsBuilder[ParakeetTDTProcessing
         }
 
 
-class ParakeetTDTMultiModalProcessor(
-    EncDecMultiModalProcessor[ParakeetTDTProcessingInfo]
+class NemotronASRMultiModalProcessor(
+    EncDecMultiModalProcessor[NemotronASRProcessingInfo]
 ):
     skip_decoder_start_token: bool = True
 
@@ -161,7 +180,7 @@ class ParakeetTDTMultiModalProcessor(
         for i, speech in enumerate(raw_speech):
             if len(speech.shape) > 1:
                 logger.warning(
-                    "Only mono-channel audio is supported for Parakeet TDT. "
+                    "Only mono-channel audio is supported for Nemotron ASR. "
                     "Averaging channels to mono."
                 )
                 raw_speech[i] = speech.mean(-1)
@@ -204,7 +223,7 @@ class ParakeetTDTMultiModalProcessor(
         elif isinstance(raw_audios, Sequence):
             audios = list(raw_audios)
         else:
-            raise ValueError("Parakeet TDT expects audio inputs.")
+            raise ValueError("Nemotron ASR expects audio inputs.")
 
         inputs = self._extract_audio_features(audios)
         inputs["input_ids"] = [[0]]
@@ -241,23 +260,11 @@ class ParakeetTDTMultiModalProcessor(
         ]
 
 
-class ParakeetTDTDecoder(TransducerPredictionDecoder):
-    def __init__(self, config: ParakeetTDTConfig) -> None:
-        super().__init__(
-            vocab_size=config.vocab_size,
-            hidden_size=config.decoder_hidden_size,
-            num_layers=config.num_decoder_layers,
-        )
-
-
-class ParakeetTDTJoint(nn.Module):
-    def __init__(self, config: ParakeetTDTConfig) -> None:
+class NemotronASRJoint(nn.Module):
+    def __init__(self, config: NemotronASRConfig) -> None:
         super().__init__()
         self.activation = nn.ReLU()
-        self.head = nn.Linear(
-            config.decoder_hidden_size,
-            config.vocab_size + len(config.durations),
-        )
+        self.head = nn.Linear(config.decoder_hidden_size, config.vocab_size)
 
     def forward(
         self,
@@ -268,24 +275,192 @@ class ParakeetTDTJoint(nn.Module):
         return self.head(hidden_states)
 
 
-class ParakeetTDTForcedDecoderState(TransducerASRForcedDecoderState):
-    """Token sequences produced by Parakeet's TDT decoder for a batch."""
+class NemotronASRCausalConv2D(nn.Conv2d):
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int,
+        groups: int = 1,
+    ) -> None:
+        super().__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=0,
+            groups=groups,
+        )
+        self.left_padding = kernel_size - 1
+        self.right_padding = stride - 1
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        padded = F.pad(input, pad=(self.left_padding, self.right_padding, 0, 0))
+        return super().forward(padded)
 
 
-class ParakeetTDTModel(nn.Module):
+class NemotronASRCausalSubsamplingConv2D(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.kernel_size = config.subsampling_conv_kernel_size
+        self.stride = config.subsampling_conv_stride
+        self.channels = config.subsampling_conv_channels
+        self.num_layers = int(math.log2(config.subsampling_factor))
+        self.layers = nn.ModuleList()
+        self.layers.append(
+            NemotronASRCausalConv2D(
+                in_channels=1,
+                out_channels=self.channels,
+                kernel_size=self.kernel_size,
+                stride=self.stride,
+            )
+        )
+        self.layers.append(nn.ReLU())
+        for _ in range(self.num_layers - 1):
+            self.layers.append(
+                NemotronASRCausalConv2D(
+                    in_channels=self.channels,
+                    out_channels=self.channels,
+                    kernel_size=self.kernel_size,
+                    stride=self.stride,
+                    groups=self.channels,
+                )
+            )
+            self.layers.append(nn.Conv2d(self.channels, self.channels, kernel_size=1))
+            self.layers.append(nn.ReLU())
+
+        out_length = self._get_output_feature_length(int(config.num_mel_bins))
+        self.linear = nn.Linear(
+            config.subsampling_conv_channels * out_length,
+            config.hidden_size,
+            bias=True,
+        )
+
+    def _get_output_feature_length(self, input_length: int) -> int:
+        length = float(input_length)
+        add_pad = self.kernel_size - 1 + self.stride - 1 - self.kernel_size
+        for _ in range(self.num_layers):
+            length = math.floor((length + add_pad) / self.stride + 1.0)
+        return int(length)
+
+    def forward(
+        self,
+        input_features: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del attention_mask
+        hidden_states = input_features.unsqueeze(1)
+        for layer in self.layers:
+            hidden_states = layer(hidden_states)
+        hidden_states = hidden_states.transpose(1, 2).reshape(
+            hidden_states.shape[0],
+            hidden_states.shape[2],
+            -1,
+        )
+        return self.linear(hidden_states)
+
+
+class NemotronASRBatchNorm1dNoStats(nn.Module):
+    def __init__(self, num_features: int, eps: float) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+        self.eps = eps
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        mean = input.mean(dim=(0, 2), keepdim=True)
+        variance = input.var(dim=(0, 2), unbiased=False, keepdim=True)
+        output = (input - mean) * torch.rsqrt(variance + self.eps)
+        return output * self.weight[None, :, None] + self.bias[None, :, None]
+
+
+class NemotronASREncoder(ParakeetEncoder):
+    def __init__(self, config) -> None:
+        super().__init__(config)
+        if bool(getattr(config, "causal_downsampling", False)):
+            self.subsampling = NemotronASRCausalSubsamplingConv2D(config)
+        self._patch_nemo_convolution_modules()
+
+    @staticmethod
+    def _conv1d_without_bias(conv: nn.Conv1d) -> nn.Conv1d:
+        return nn.Conv1d(
+            in_channels=conv.in_channels,
+            out_channels=conv.out_channels,
+            kernel_size=conv.kernel_size,
+            stride=conv.stride,
+            padding=conv.padding,
+            dilation=conv.dilation,
+            groups=conv.groups,
+            bias=False,
+            padding_mode=conv.padding_mode,
+        )
+
+    def _patch_nemo_convolution_modules(self) -> None:
+        for layer in self.layers:
+            conv_module = getattr(layer, "conv", None)
+            if conv_module is None:
+                continue
+            for conv_name in (
+                "pointwise_conv1",
+                "depthwise_conv",
+                "pointwise_conv2",
+            ):
+                conv = getattr(conv_module, conv_name, None)
+                if isinstance(conv, nn.Conv1d) and conv.bias is not None:
+                    setattr(conv_module, conv_name, self._conv1d_without_bias(conv))
+
+            norm = getattr(conv_module, "norm", None)
+            if isinstance(norm, nn.BatchNorm1d):
+                conv_module.norm = NemotronASRBatchNorm1dNoStats(
+                    norm.num_features,
+                    eps=norm.eps,
+                )
+
+    def _get_subsampling_output_length(self, input_lengths: torch.Tensor):
+        if not bool(getattr(self.config, "causal_downsampling", False)):
+            return super()._get_subsampling_output_length(input_lengths)
+
+        kernel_size = self.config.subsampling_conv_kernel_size
+        stride = self.config.subsampling_conv_stride
+        num_layers = int(math.log2(self.config.subsampling_factor))
+        lengths = input_lengths.to(dtype=torch.float)
+        for _ in range(num_layers):
+            lengths = torch.div(lengths - kernel_size, stride, rounding_mode="floor")
+            lengths = lengths + 1
+        return lengths.clamp_min(0).to(dtype=torch.int)
+
+
+class NemotronASRModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        config: ParakeetTDTConfig = vllm_config.model_config.hf_config
+        config: NemotronASRConfig = vllm_config.model_config.hf_config
         self.config = config
         self.dtype = vllm_config.model_config.dtype
 
-        self.encoder = ParakeetEncoder(config.encoder_config).to(self.dtype)
+        self.encoder = NemotronASREncoder(config.encoder_config).to(self.dtype)
+        self.prompt_kernel = nn.Sequential(
+            nn.Linear(
+                config.encoder_config.hidden_size + config.prompt_dim,
+                config.encoder_config.hidden_size * 2,
+            ),
+            nn.ReLU(),
+            nn.Linear(
+                config.encoder_config.hidden_size * 2,
+                config.encoder_config.hidden_size,
+            ),
+        )
         self.encoder_projector = nn.Linear(
             config.encoder_config.hidden_size,
             config.decoder_hidden_size,
         )
-        self.decoder = ParakeetTDTDecoder(config)
-        self.joint = ParakeetTDTJoint(config)
+        self.decoder = TransducerPredictionDecoder(
+            vocab_size=config.vocab_size,
+            hidden_size=config.decoder_hidden_size,
+            num_layers=config.num_decoder_layers,
+        )
+        self.joint = NemotronASRJoint(config)
 
     def get_encoder_outputs(
         self,
@@ -312,6 +487,37 @@ class ParakeetTDTModel(nn.Module):
             for hidden_state, mask in zip(hidden_states, output_mask)
         ]
 
+    def _encoder_with_language_prompt(
+        self,
+        encoder_outputs: Sequence[torch.Tensor],
+        prompt_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        device = encoder_outputs[0].device
+        padded_outputs = nn.utils.rnn.pad_sequence(
+            list(encoder_outputs), batch_first=True
+        )
+        if prompt_ids is None:
+            prompt_id = self.config.prompt_id_for_language(None)
+            prompt_ids = torch.full(
+                (len(encoder_outputs),),
+                prompt_id,
+                dtype=torch.long,
+                device=device,
+            )
+        prompt_one_hot = torch.nn.functional.one_hot(
+            prompt_ids.to(device=device),
+            num_classes=self.config.prompt_dim,
+        ).to(dtype=padded_outputs.dtype)
+        prompt_vectors = prompt_one_hot[:, None, :].expand(
+            -1,
+            padded_outputs.shape[1],
+            -1,
+        )
+        prompted = self.prompt_kernel(
+            torch.cat((padded_outputs, prompt_vectors), dim=-1)
+        )
+        return self.encoder_projector(prompted)
+
     def _joint_logits(
         self,
         encoder_state: torch.Tensor,
@@ -319,77 +525,30 @@ class ParakeetTDTModel(nn.Module):
     ) -> torch.Tensor:
         return self.joint(encoder_state, decoder_state)
 
-    def greedy_decode(self, encoder_output: torch.Tensor) -> list[int]:
-        cfg = self.config
-        device = encoder_output.device
-        token_ids: list[int] = []
-        state: tuple[torch.Tensor, torch.Tensor] | None = None
-        last_token: int | None = None
-        encoder_projected = self.encoder_projector(encoder_output)
-
-        time_idx = 0
-        out_len = int(encoder_output.shape[0])
-        while time_idx < out_len:
-            encoder_state = encoder_projected[time_idx : time_idx + 1]
-            symbols_added = 0
-            need_loop = True
-            skip = 1
-
-            while need_loop and symbols_added < cfg.max_symbols_per_step:
-                label = cfg.blank_token_id if last_token is None else last_token
-                pred_state, next_state = self.decoder.predict(label, state, device)
-                logits = self._joint_logits(encoder_state, pred_state)[0]
-
-                token_logits = logits[: cfg.vocab_size].float()
-                duration_logits = logits[cfg.vocab_size :].float()
-                score, token = token_logits.max(0)
-                del score
-
-                duration_idx = int(duration_logits.argmax().item())
-                skip = cfg.durations[duration_idx]
-                token_id = int(token.item())
-                if token_id == cfg.blank_token_id and skip == 0:
-                    skip = 1
-
-                if token_id != cfg.blank_token_id:
-                    token_ids.append(token_id)
-                    state = next_state
-                    last_token = token_id
-
-                symbols_added += 1
-                time_idx += skip
-                need_loop = skip == 0
-
-            if need_loop:
-                time_idx += 1
-
-        token_ids.append(cfg.eos_token_id)
-        return token_ids
-
     def greedy_decode_batch(
         self,
         encoder_outputs: Sequence[torch.Tensor],
+        prompt_ids: torch.Tensor | None = None,
     ) -> list[list[int]]:
         if not encoder_outputs:
             return []
 
-        cfg = self.config
         device = encoder_outputs[0].device
+        cfg = self.config
         lengths = torch.tensor(
             [int(encoder_output.shape[0]) for encoder_output in encoder_outputs],
             dtype=torch.long,
             device=device,
         )
-        encoder_projected = self.encoder_projector(
-            nn.utils.rnn.pad_sequence(list(encoder_outputs), batch_first=True)
+        encoder_projected = self._encoder_with_language_prompt(
+            encoder_outputs,
+            prompt_ids=prompt_ids,
         )
-
         decode_config = TransducerDecodeConfig(
             vocab_size=cfg.vocab_size,
             blank_token_id=cfg.blank_token_id,
             eos_token_id=cfg.eos_token_id,
             max_symbols_per_step=cfg.max_symbols_per_step,
-            durations=cfg.durations,
         )
         return greedy_decode_transducer_batch(
             encoder_projected=encoder_projected,
@@ -401,20 +560,27 @@ class ParakeetTDTModel(nn.Module):
 
 
 @MULTIMODAL_REGISTRY.register_processor(
-    ParakeetTDTMultiModalProcessor,
-    info=ParakeetTDTProcessingInfo,
-    dummy_inputs=ParakeetTDTDummyInputsBuilder,
+    NemotronASRMultiModalProcessor,
+    info=NemotronASRProcessingInfo,
+    dummy_inputs=NemotronASRDummyInputsBuilder,
 )
 @support_torch_compile(
     dynamic_arg_dims={"input_ids": 0, "positions": -1, "forced_decoder_ids": 0}
 )
-class ParakeetForTDT(nn.Module, SupportsTranscription, SupportsMultiModal):
+class NemotronASRForRNNT(
+    nn.Module,
+    SupportsTranscription,
+    SupportsMultiModal,
+    SupportsRealtime,
+):
     supports_transcription_only = True
-    supported_languages = PARAKEET_SUPPORTED_LANGUAGES
-    no_space_languages: set[str] = set()
+    supported_languages = NEMOTRON_ASR_SUPPORTED_LANGUAGES
+    no_space_languages: set[str] = {"ja", "zh"}
+    realtime_max_tokens = 256
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "encoder.": "model.encoder.",
+            "prompt_kernel.": "model.prompt_kernel.",
             "encoder_projector.": "model.encoder_projector.",
             "decoder.": "model.decoder.",
             "joint.": "model.joint.",
@@ -423,11 +589,11 @@ class ParakeetForTDT(nn.Module, SupportsTranscription, SupportsMultiModal):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        self.config: ParakeetTDTConfig = vllm_config.model_config.hf_config
+        self.config: NemotronASRConfig = vllm_config.model_config.hf_config
         self.dtype = vllm_config.model_config.dtype
 
         with self._mark_tower_model(vllm_config, "audio"):
-            self.model = ParakeetTDTModel(vllm_config=vllm_config, prefix=prefix)
+            self.model = NemotronASRModel(vllm_config=vllm_config, prefix=prefix)
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -438,6 +604,34 @@ class ParakeetForTDT(nn.Module, SupportsTranscription, SupportsMultiModal):
 
     def get_language_model(self) -> nn.Module:
         return self.model.decoder
+
+    @classmethod
+    def validate_language(cls, language: str | None) -> str | None:
+        if language in (None, "auto"):
+            return language
+        if language in cls.supported_languages:
+            return language
+        if language in NEMOTRON_ASR_LANGUAGE_ALIASES:
+            return language
+        raise ValueError(
+            f"Unsupported language: {language!r}. Must be 'auto' or one of "
+            f"{list(cls.supported_languages.keys())}."
+        )
+
+    @classmethod
+    def update_speech_to_text_sampling_params(
+        cls,
+        *,
+        sampling_params: object,
+        model_config: ModelConfig,
+        language: str | None,
+    ) -> None:
+        hf_config: NemotronASRConfig = model_config.hf_config
+        extra_args = dict(getattr(sampling_params, "extra_args", None) or {})
+        extra_args["transducer_asr_prompt_id"] = hf_config.prompt_id_for_language(
+            language
+        )
+        sampling_params.extra_args = extra_args
 
     def _parse_and_validate_audio_input(
         self,
@@ -458,9 +652,9 @@ class ParakeetForTDT(nn.Module, SupportsTranscription, SupportsMultiModal):
             )
 
         if not isinstance(input_features, torch.Tensor):
-            raise ValueError("Parakeet TDT requires input_features.")
+            raise ValueError("Nemotron ASR requires input_features.")
         if not isinstance(attention_mask, torch.Tensor):
-            raise ValueError("Parakeet TDT requires attention_mask.")
+            raise ValueError("Nemotron ASR requires attention_mask.")
 
         return input_features, attention_mask
 
@@ -491,7 +685,7 @@ class ParakeetForTDT(nn.Module, SupportsTranscription, SupportsMultiModal):
         del intermediate_tensors, kwargs
 
         if input_ids is None:
-            raise ValueError("Parakeet TDT forward requires input_ids.")
+            raise ValueError("Nemotron ASR forward requires input_ids.")
 
         batch_size = input_ids.shape[0]
         device = input_ids.device
@@ -504,7 +698,7 @@ class ParakeetForTDT(nn.Module, SupportsTranscription, SupportsMultiModal):
                 )
 
             if forced_decoder_sequences:
-                forced_decoder_state = ParakeetTDTForcedDecoderState(
+                forced_decoder_state = TransducerASRForcedDecoderState(
                     eos_token_id=self.config.eos_token_id
                 )
                 forced_decoder_state.set_sequences(forced_decoder_sequences)
@@ -521,16 +715,13 @@ class ParakeetForTDT(nn.Module, SupportsTranscription, SupportsMultiModal):
                     device=device,
                 )
 
-        vocab_size = self.config.vocab_size
         logits = torch.full(
-            (batch_size, vocab_size),
+            (batch_size, self.config.vocab_size),
             -1.0e9,
             dtype=torch.float32,
             device=device,
         )
-
         logits.scatter_(1, forced_token_ids.unsqueeze(1), 0.0)
-
         return logits
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -550,6 +741,7 @@ class ParakeetForTDT(nn.Module, SupportsTranscription, SupportsMultiModal):
         return SpeechToTextConfig(
             sample_rate=hf_config.sample_rate,
             max_audio_clip_s=30,
+            min_energy_split_window_size=None,
         )
 
     @classmethod
@@ -559,15 +751,65 @@ class ParakeetForTDT(nn.Module, SupportsTranscription, SupportsMultiModal):
     ) -> PromptType:
         audio = stt_params.audio
         sample_rate = stt_params.stt_config.sample_rate
-        blank_token_id = stt_params.model_config.hf_config.blank_token_id
+        hf_config = stt_params.model_config.hf_config
+        hf_config.resolve_prompt_language(stt_params.language)
 
         return ExplicitEncoderDecoderPrompt(
             encoder_prompt=TextPrompt(
                 prompt="",
                 multi_modal_data={"audio": (audio, sample_rate)},
             ),
-            decoder_prompt=TokensPrompt(prompt_token_ids=[blank_token_id]),
+            decoder_prompt=TokensPrompt(prompt_token_ids=[hf_config.blank_token_id]),
         )
+
+    @classmethod
+    async def buffer_realtime_audio(
+        cls,
+        audio_stream: AsyncGenerator[np.ndarray, None],
+        input_stream: asyncio.Queue[list[int]],
+        model_config: ModelConfig,
+    ) -> AsyncGenerator[PromptType, None]:
+        del input_stream
+        hf_config = model_config.hf_config
+        sample_rate = int(hf_config.sample_rate)
+        chunk_samples = max(
+            1, int(round(sample_rate * hf_config.realtime_chunk_ms / 1000))
+        )
+        buffer = np.empty(0, dtype=np.float32)
+
+        async for audio_chunk in audio_stream:
+            buffer = np.concatenate(
+                (buffer, audio_chunk.astype(np.float32, copy=False))
+            )
+            while len(buffer) >= chunk_samples:
+                segment = buffer[:chunk_samples].copy()
+                buffer = buffer[chunk_samples:]
+                yield cls.get_generation_prompt(
+                    SpeechToTextParams(
+                        audio=segment,
+                        stt_config=SpeechToTextConfig(
+                            sample_rate=sample_rate,
+                            max_audio_clip_s=None,
+                            min_energy_split_window_size=None,
+                        ),
+                        model_config=model_config,
+                        language=None,
+                    )
+                )
+
+        if len(buffer) > 0:
+            yield cls.get_generation_prompt(
+                SpeechToTextParams(
+                    audio=buffer.copy(),
+                    stt_config=SpeechToTextConfig(
+                        sample_rate=sample_rate,
+                        max_audio_clip_s=None,
+                        min_energy_split_window_size=None,
+                    ),
+                    model_config=model_config,
+                    language=None,
+                )
+            )
 
     @classmethod
     def get_num_audio_tokens(
@@ -583,9 +825,11 @@ class ParakeetForTDT(nn.Module, SupportsTranscription, SupportsMultiModal):
 
     @classmethod
     def post_process_output(cls, text: str) -> str:
-        for special_token in ("<blank>", "<|endoftext|>"):
-            text = text.replace(special_token, "")
-        return text.strip()
+        return strip_asr_special_tokens(text)
 
 
-__all__ = ["ParakeetForTDT", "ParakeetTDTForcedDecoderState"]
+__all__ = [
+    "NEMOTRON_ASR_SUPPORTED_LANGUAGES",
+    "NemotronASRForRNNT",
+    "NemotronASRModel",
+]
