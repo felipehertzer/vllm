@@ -143,6 +143,14 @@ def greedy_decode_transducer_batch(
     duration_values = (
         torch.tensor(durations, dtype=torch.long, device=device) if is_tdt else None
     )
+    if not is_tdt:
+        return _greedy_decode_rnnt_batch(
+            encoder_projected=encoder_projected,
+            lengths=lengths,
+            decoder=decoder,
+            joint_logits=joint_logits,
+            config=config,
+        )
 
     time_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
     last_tokens = torch.full(
@@ -263,6 +271,230 @@ def greedy_decode_transducer_batch(
         output_ids_cpu[row, :output_length].tolist()
         for row, output_length in enumerate(output_lengths_cpu)
     ]
+
+
+def _greedy_decode_rnnt_batch(
+    *,
+    encoder_projected: torch.Tensor,
+    lengths: torch.Tensor,
+    decoder: TransducerPredictionDecoder,
+    joint_logits,
+    config: TransducerDecodeConfig,
+) -> list[list[int]]:
+    device = encoder_projected.device
+    batch_size = int(encoder_projected.shape[0])
+    max_encoder_frames = int(encoder_projected.shape[1])
+    if device.type == "cpu" and batch_size == 1:
+        return [
+            _greedy_decode_rnnt_single_cpu(
+                encoder_projected=encoder_projected[0],
+                length=int(lengths[0].item()),
+                decoder=decoder,
+                joint_logits=joint_logits,
+                config=config,
+            )
+        ]
+
+    time_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
+    last_tokens = torch.full(
+        (batch_size,),
+        config.blank_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+    has_last_token = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    state: tuple[torch.Tensor, torch.Tensor] | None = None
+    cached_pred_state: torch.Tensor | None = None
+    cached_next_state: tuple[torch.Tensor, torch.Tensor] | None = None
+    cached_prediction_valid = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    max_output_tokens = max_encoder_frames * config.max_symbols_per_step + 1
+    output_ids = torch.full(
+        (batch_size, max_output_tokens),
+        config.eos_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+    output_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    for _ in range(max_encoder_frames):
+        active = torch.nonzero(time_idx < lengths, as_tuple=False).flatten()
+        if active.numel() == 0:
+            break
+        symbols_added = torch.zeros(active.shape[0], dtype=torch.long, device=device)
+        needs_loop = torch.ones(active.shape[0], dtype=torch.bool, device=device)
+        still_looping_after_limit = torch.zeros(
+            active.shape[0], dtype=torch.bool, device=device
+        )
+
+        for _symbol_step in range(config.max_symbols_per_step):
+            loop_positions = torch.nonzero(needs_loop, as_tuple=False).flatten()
+            if loop_positions.numel() == 0:
+                break
+            loop_rows = active[loop_positions]
+            uncached_positions = torch.nonzero(
+                ~cached_prediction_valid[loop_rows],
+                as_tuple=False,
+            ).flatten()
+            if uncached_positions.numel() > 0:
+                uncached_rows = loop_rows[uncached_positions]
+                labels = torch.where(
+                    has_last_token[uncached_rows],
+                    last_tokens[uncached_rows],
+                    torch.full_like(uncached_rows, config.blank_token_id),
+                )
+                pred_state, next_state = decoder.predict_batch(
+                    labels,
+                    state,
+                    uncached_rows,
+                )
+                if cached_pred_state is None:
+                    num_layers = next_state[0].shape[0]
+                    hidden_size = next_state[0].shape[-1]
+                    cached_pred_state = torch.zeros(
+                        batch_size,
+                        hidden_size,
+                        dtype=pred_state.dtype,
+                        device=device,
+                    )
+                    cached_next_state = (
+                        torch.zeros(
+                            num_layers,
+                            batch_size,
+                            hidden_size,
+                            dtype=next_state[0].dtype,
+                            device=device,
+                        ),
+                        torch.zeros(
+                            num_layers,
+                            batch_size,
+                            hidden_size,
+                            dtype=next_state[1].dtype,
+                            device=device,
+                        ),
+                    )
+                    if state is None:
+                        state = (
+                            torch.zeros_like(cached_next_state[0]),
+                            torch.zeros_like(cached_next_state[1]),
+                        )
+
+                assert cached_pred_state is not None
+                assert cached_next_state is not None
+                cached_pred_state[uncached_rows] = pred_state
+                cached_next_state[0][:, uncached_rows, :] = next_state[0]
+                cached_next_state[1][:, uncached_rows, :] = next_state[1]
+                cached_prediction_valid[uncached_rows] = True
+
+            assert cached_pred_state is not None
+            pred_state = cached_pred_state[loop_rows]
+            encoder_state = encoder_projected[loop_rows, time_idx[loop_rows]]
+            logits = joint_logits(encoder_state, pred_state)
+
+            token_logits = logits[:, : config.vocab_size].float()
+            tokens = token_logits.argmax(dim=1)
+            blank_tokens = tokens == config.blank_token_id
+            skips = torch.where(
+                blank_tokens,
+                torch.ones_like(tokens, dtype=torch.long),
+                torch.zeros_like(tokens, dtype=torch.long),
+            )
+            needs_next_loop = ~blank_tokens
+
+            nonblank_tokens = ~blank_tokens
+            nonblank_rows = loop_rows[nonblank_tokens]
+            emit_positions = output_lengths[nonblank_rows]
+            output_ids[nonblank_rows, emit_positions] = tokens[nonblank_tokens]
+            output_lengths[nonblank_rows] += 1
+
+            last_tokens[nonblank_rows] = tokens[nonblank_tokens]
+            has_last_token[nonblank_rows] = True
+            if nonblank_rows.numel() > 0:
+                assert state is not None
+                assert cached_next_state is not None
+                state[0][:, nonblank_rows, :] = cached_next_state[0][
+                    :, nonblank_rows, :
+                ]
+                state[1][:, nonblank_rows, :] = cached_next_state[1][
+                    :, nonblank_rows, :
+                ]
+                cached_prediction_valid[nonblank_rows] = False
+
+            time_idx[loop_rows] += skips
+            symbols_added[loop_positions] += 1
+            still_looping_after_limit[loop_positions] = needs_next_loop
+            needs_loop[loop_positions] = needs_next_loop & (
+                symbols_added[loop_positions] < config.max_symbols_per_step
+            )
+
+        advance_after_limit = active[
+            still_looping_after_limit & (symbols_added >= config.max_symbols_per_step)
+        ]
+        time_idx[advance_after_limit] += 1
+
+    eos_positions = output_lengths.clamp(max=max_output_tokens - 1)
+    batch_indices = torch.arange(batch_size, dtype=torch.long, device=device)
+    output_ids[batch_indices, eos_positions] = config.eos_token_id
+    output_lengths = eos_positions + 1
+
+    output_ids_cpu = output_ids.cpu()
+    output_lengths_cpu = output_lengths.cpu().tolist()
+    return [
+        output_ids_cpu[row, :output_length].tolist()
+        for row, output_length in enumerate(output_lengths_cpu)
+    ]
+
+
+def _greedy_decode_rnnt_single_cpu(
+    *,
+    encoder_projected: torch.Tensor,
+    length: int,
+    decoder: TransducerPredictionDecoder,
+    joint_logits,
+    config: TransducerDecodeConfig,
+) -> list[int]:
+    assert encoder_projected.device.type == "cpu"
+
+    output_ids: list[int] = []
+    state: tuple[torch.Tensor, torch.Tensor] | None = None
+    cached_pred_state: torch.Tensor | None = None
+    cached_next_state: tuple[torch.Tensor, torch.Tensor] | None = None
+    cached_prediction_valid = False
+    label = torch.tensor([config.blank_token_id], dtype=torch.long)
+    rows = torch.tensor([0], dtype=torch.long)
+
+    time_idx = 0
+    length = min(length, int(encoder_projected.shape[0]))
+    while time_idx < length:
+        symbols_added = 0
+        while symbols_added < config.max_symbols_per_step:
+            if not cached_prediction_valid:
+                pred_state, next_state = decoder.predict_batch(label, state, rows)
+                cached_pred_state = pred_state
+                cached_next_state = next_state
+                cached_prediction_valid = True
+
+            assert cached_pred_state is not None
+            logits = joint_logits(
+                encoder_projected[time_idx : time_idx + 1],
+                cached_pred_state,
+            )
+            token = int(logits[0, : config.vocab_size].float().argmax().item())
+
+            if token == config.blank_token_id:
+                time_idx += 1
+                break
+
+            output_ids.append(token)
+            label[0] = token
+            state = cached_next_state
+            cached_prediction_valid = False
+            symbols_added += 1
+        else:
+            time_idx += 1
+
+    output_ids.append(config.eos_token_id)
+    return output_ids
 
 
 def strip_asr_special_tokens(text: str) -> str:

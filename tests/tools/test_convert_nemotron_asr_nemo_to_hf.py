@@ -36,6 +36,7 @@ def test_build_nemotron_asr_config_for_prompt_streaming_layout():
                 "att_context_style": "chunked_limited",
                 "att_context_size": [56, 3],
                 "causal_downsampling": True,
+                "conv_norm_type": "layer_norm",
                 "conv_context_size": "causal",
             },
             "decoder": {
@@ -59,6 +60,40 @@ def test_build_nemotron_asr_config_for_prompt_streaming_layout():
     assert config["encoder_config"]["att_context_style"] == "chunked_limited"
     assert config["encoder_config"]["att_context_left"] == 56
     assert config["encoder_config"]["att_context_right"] == 3
+    assert config["encoder_config"]["conv_norm_type"] == "layer_norm"
+    assert config["encoder_config"]["conv_causal"] is True
+
+
+def test_build_nemotron_asr_config_supports_english_only_without_prompt():
+    config = build_nemotron_asr_config(
+        {
+            "sample_rate": 16000,
+            "model_defaults": {
+                "enc_hidden": 1024,
+                "pred_hidden": 640,
+                "joint_hidden": 640,
+            },
+            "preprocessor": {"features": 128},
+            "encoder": {
+                "n_layers": 24,
+                "d_model": 1024,
+                "n_heads": 8,
+                "ff_expansion_factor": 4,
+                "subsampling_factor": 8,
+            },
+            "decoder": {
+                "vocab_size": 1024,
+                "prednet": {"pred_hidden": 640, "pred_rnn_layers": 2},
+            },
+            "joint": {
+                "num_classes": 1024,
+                "jointnet": {"activation": "relu", "joint_hidden": 640},
+            },
+        }
+    )
+
+    assert config["prompt_dim"] == 0
+    assert config["prompt_language_to_id"]["en-US"] == 0
 
 
 def test_normalize_nemotron_asr_weight_name_maps_nemo_keys_to_hf_layout():
@@ -106,3 +141,20 @@ def test_normalize_state_dict_requires_nemotron_asr_prefixes():
     assert "decoder.decoder_projector.weight" in converted
     assert "encoder_projector.weight" in converted
     assert "joint.head.weight" in converted
+
+
+def test_normalize_state_dict_allows_english_only_without_prompt_kernel():
+    state_dict = {
+        "encoder.pre_encode.out.weight": torch.empty(1),
+        "encoder.layers.0.self_attn.linear_q.weight": torch.empty(1),
+        "decoder.prediction.embed.weight": torch.empty(1),
+        "decoder.prediction.dec_rnn.lstm.weight_ih_l0": torch.empty(1),
+        "joint.pred.weight": torch.empty(1),
+        "joint.enc.weight": torch.empty(1),
+        "joint.joint_net.2.weight": torch.empty(1),
+    }
+
+    converted = normalize_state_dict(state_dict)
+
+    assert "prompt_kernel.0.weight" not in converted
+    assert "encoder_projector.weight" in converted

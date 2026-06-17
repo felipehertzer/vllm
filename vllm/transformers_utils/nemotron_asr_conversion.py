@@ -20,9 +20,7 @@ from tokenizers import Tokenizer, decoders, normalizers, pre_tokenizers
 from tokenizers.models import BPE
 from transformers.convert_slow_tokenizer import SentencePieceExtractor
 
-from vllm.transformers_utils.configs.nemotron_asr import (
-    NEMOTRON_ASR_DEFAULT_LANGUAGE,
-)
+from vllm.transformers_utils.configs.nemotron_asr import NEMOTRON_ASR_DEFAULT_LANGUAGE
 
 DEFAULT_ENCODER_CONFIG = {
     "activation_dropout": 0.1,
@@ -128,6 +126,12 @@ def _prompt_dictionary(
     model_defaults = _get(nemo_config, "model_defaults", {}) or {}
     prompt_dictionary = _get(model_defaults, "prompt_dictionary", {}) or {}
     if not prompt_dictionary:
+        if not bool(_get(model_defaults, "initialize_prompt_feature", False)):
+            return (
+                0,
+                {"auto": 0, "en": 0, NEMOTRON_ASR_DEFAULT_LANGUAGE: 0},
+                NEMOTRON_ASR_DEFAULT_LANGUAGE,
+            )
         return (
             128,
             {"auto": 0, NEMOTRON_ASR_DEFAULT_LANGUAGE: 1},
@@ -224,6 +228,7 @@ def build_nemotron_asr_config(nemo_config: Mapping[str, Any]) -> dict[str, Any]:
             "attention_bias": bool(_pick(nemo_config, ("encoder.use_bias",), False)),
             "attention_dropout": _as_float(_get(encoder, "dropout_att"), 0.1),
             "conv_kernel_size": _as_int(_get(encoder, "conv_kernel_size"), 9),
+            "conv_norm_type": str(_get(encoder, "conv_norm_type", "batch_norm")),
             "convolution_bias": bool(_get(encoder, "use_bias", False)),
             "dropout": _as_float(_get(encoder, "dropout"), 0.1),
             "dropout_positions": _as_float(_get(encoder, "dropout_emb"), 0.0),
@@ -322,15 +327,16 @@ def normalize_state_dict(state_dict: Mapping[str, Any]) -> dict[str, torch.Tenso
             continue
         converted[new_name] = tensor.contiguous()
 
-    required_prefixes = (
+    required_prefixes = [
         "encoder.",
-        "prompt_kernel.",
         "encoder_projector.",
         "decoder.embedding.",
         "decoder.lstm.",
         "decoder.decoder_projector.",
         "joint.head.",
-    )
+    ]
+    if any(name.startswith("prompt_kernel.") for name in converted):
+        required_prefixes.append("prompt_kernel.")
     missing = [
         prefix
         for prefix in required_prefixes

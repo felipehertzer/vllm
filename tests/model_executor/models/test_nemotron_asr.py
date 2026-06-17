@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 from transformers import ParakeetEncoderConfig
 
 from vllm.model_executor.models.config import (
@@ -12,9 +13,13 @@ from vllm.model_executor.models.config import (
     NemotronASRForRNNTConfig,
 )
 from vllm.model_executor.models.nemotron_asr import (
+    NemotronASRAttention,
+    NemotronASRCausalConv1D,
     NemotronASRCausalSubsamplingConv2D,
+    NemotronASRConvLayerNorm,
     NemotronASREncoder,
     NemotronASRForRNNT,
+    NemotronASRModel,
 )
 from vllm.model_executor.models.transducer_asr import (
     TransducerDecodeConfig,
@@ -26,7 +31,11 @@ from vllm.transformers_utils.configs.nemotron_asr import NemotronASRConfig
 
 
 class _FakeDecoder:
+    def __init__(self):
+        self.calls = 0
+
     def predict_batch(self, token_ids, state, rows):
+        self.calls += 1
         batch = token_ids.shape[0]
         del state, rows
         pred_state = torch.zeros(batch, 4)
@@ -89,6 +98,46 @@ def test_nemotron_sampling_params_carry_prompt_id():
     assert sampling_params.extra_args == {"transducer_asr_prompt_id": 2}
 
 
+def test_nemotron_mps_encoder_hybrid_uses_auto_when_available(monkeypatch):
+    monkeypatch.delenv("NEMOTRON_ASR_MPS_ENCODER", raising=False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(torch.backends.mps, "is_built", lambda: True)
+
+    assert NemotronASRModel._should_use_mps_encoder_hybrid(torch.float32)
+
+
+def test_nemotron_mps_encoder_hybrid_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("NEMOTRON_ASR_MPS_ENCODER", "0")
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(torch.backends.mps, "is_built", lambda: True)
+
+    assert not NemotronASRModel._should_use_mps_encoder_hybrid(torch.float32)
+
+
+def test_nemotron_mps_encoder_dtype_defaults_to_float16(monkeypatch):
+    monkeypatch.delenv("NEMOTRON_ASR_MPS_ENCODER_DTYPE", raising=False)
+
+    assert NemotronASRModel._get_mps_encoder_dtype() is torch.float16
+
+
+def test_nemotron_mps_encoder_dtype_accepts_float32(monkeypatch):
+    monkeypatch.setenv("NEMOTRON_ASR_MPS_ENCODER_DTYPE", "float32")
+
+    assert NemotronASRModel._get_mps_encoder_dtype() is torch.float32
+
+
+def test_nemotron_cuda_decoder_defaults_to_cpu(monkeypatch):
+    monkeypatch.delenv("NEMOTRON_ASR_CUDA_DECODER_DEVICE", raising=False)
+
+    assert NemotronASRModel._should_use_cuda_cpu_decoder()
+
+
+def test_nemotron_cuda_decoder_can_stay_on_cuda(monkeypatch):
+    monkeypatch.setenv("NEMOTRON_ASR_CUDA_DECODER_DEVICE", "cuda")
+
+    assert not NemotronASRModel._should_use_cuda_cpu_decoder()
+
+
 def test_nemotron_causal_subsampling_matches_nemo_flatten_width():
     config = ParakeetEncoderConfig(
         hidden_size=1024,
@@ -103,7 +152,45 @@ def test_nemotron_causal_subsampling_matches_nemo_flatten_width():
     output = subsampling(torch.zeros(1, 101, 128))
 
     assert subsampling.linear.in_features == 256 * 17
-    assert output.shape == (1, 11, 1024)
+    assert output.shape == (1, 14, 1024)
+
+
+def test_nemotron_encoder_causal_subsampling_length_matches_nemo():
+    config = ParakeetEncoderConfig(
+        hidden_size=1024,
+        num_mel_bins=128,
+        subsampling_conv_channels=256,
+        subsampling_factor=8,
+        subsampling_conv_kernel_size=3,
+        subsampling_conv_stride=2,
+        causal_downsampling=True,
+    )
+    encoder = NemotronASREncoder(config)
+
+    output_lengths = encoder._get_subsampling_output_length(torch.tensor([2999]))
+
+    assert output_lengths.tolist() == [376]
+
+
+def test_nemotron_encoder_wraps_attention_for_cuda_compile():
+    config = ParakeetEncoderConfig(
+        hidden_size=8,
+        intermediate_size=32,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_hidden_layers=1,
+        num_mel_bins=128,
+        subsampling_conv_channels=4,
+        subsampling_factor=8,
+    )
+
+    encoder = NemotronASREncoder(config)
+    assert not isinstance(encoder.layers[0].self_attn, NemotronASRAttention)
+
+    encoder._patch_nemo_attention_modules()
+
+    assert isinstance(encoder.layers[0].self_attn, NemotronASRAttention)
+    assert hasattr(encoder.layers[0].self_attn, "q_proj")
 
 
 def test_nemotron_encoder_state_dict_matches_nemo_conv_layout():
@@ -117,6 +204,8 @@ def test_nemotron_encoder_state_dict_matches_nemo_conv_layout():
         subsampling_conv_channels=4,
         subsampling_factor=8,
         causal_downsampling=True,
+        conv_causal=True,
+        conv_norm_type="layer_norm",
     )
 
     encoder = NemotronASREncoder(config)
@@ -125,7 +214,59 @@ def test_nemotron_encoder_state_dict_matches_nemo_conv_layout():
     assert conv.pointwise_conv1.bias is None
     assert conv.depthwise_conv.bias is None
     assert conv.pointwise_conv2.bias is None
+    assert isinstance(conv.depthwise_conv, NemotronASRCausalConv1D)
+    assert isinstance(conv.norm, NemotronASRConvLayerNorm)
     assert set(conv.norm.state_dict()) == {"weight", "bias"}
+
+
+def test_nemotron_causal_conv1d_matches_manual_left_padding():
+    torch.manual_seed(0)
+    source = torch.nn.Conv1d(
+        in_channels=4,
+        out_channels=4,
+        kernel_size=5,
+        groups=4,
+        bias=False,
+    )
+    causal = NemotronASRCausalConv1D(source)
+    causal.weight.data.copy_(source.weight)
+    inputs = torch.randn(2, 4, 11)
+
+    expected = source(F.pad(inputs, pad=(4, 0)))
+
+    torch.testing.assert_close(causal(inputs), expected)
+    assert causal._uses_manual_depthwise_kernel("cpu")
+    assert causal._uses_manual_depthwise_kernel("mps")
+    assert not causal._uses_manual_depthwise_kernel("cuda")
+
+
+def test_nemotron_encoder_uses_chunked_limited_attention_mask():
+    config = ParakeetEncoderConfig(
+        hidden_size=8,
+        intermediate_size=32,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_hidden_layers=1,
+        num_mel_bins=128,
+        subsampling_conv_channels=4,
+        subsampling_factor=8,
+        causal_downsampling=True,
+        att_context_style="chunked_limited",
+        att_context_left=2,
+        att_context_right=1,
+    )
+    encoder = NemotronASREncoder(config)
+
+    mask = encoder._get_nemo_attention_mask(
+        torch.ones(1, 48, dtype=torch.bool),
+        target_length=6,
+    )
+
+    assert mask.shape == (1, 1, 6, 6)
+    assert bool(mask[0, 0, 0, 1])
+    assert not bool(mask[0, 0, 1, 2])
+    assert bool(mask[0, 0, 4, 2])
+    assert not bool(mask[0, 0, 4, 0])
 
 
 def test_nemotron_config_updates_runtime_metadata():
@@ -207,6 +348,26 @@ def test_rnnt_greedy_decode_batch_advances_at_symbol_limit():
     )
 
     assert outputs == [[0, 0, 1]]
+
+
+def test_rnnt_greedy_decode_batch_reuses_prediction_on_blank_frames():
+    decoder = _FakeDecoder()
+
+    outputs = greedy_decode_transducer_batch(
+        encoder_projected=torch.zeros(1, 3, 4),
+        lengths=torch.tensor([3]),
+        decoder=decoder,
+        joint_logits=lambda encoder_state, pred_state: torch.tensor([[0.0, 0.0, 9.0]]),
+        config=TransducerDecodeConfig(
+            vocab_size=3,
+            blank_token_id=2,
+            eos_token_id=1,
+            max_symbols_per_step=4,
+        ),
+    )
+
+    assert outputs == [[1]]
+    assert decoder.calls == 1
 
 
 def test_strip_asr_special_tokens_preserves_words():

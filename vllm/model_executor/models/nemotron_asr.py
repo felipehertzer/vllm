@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -14,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import ParakeetEncoder
 from transformers.feature_extraction_utils import BatchFeature
+from transformers.modeling_outputs import BaseModelOutput
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
@@ -275,6 +277,181 @@ class NemotronASRJoint(nn.Module):
         return self.head(hidden_states)
 
 
+def _nemotron_rel_shift(attention_scores: torch.Tensor) -> torch.Tensor:
+    batch_size, num_heads, query_length, position_length = attention_scores.shape
+    attention_scores = F.pad(attention_scores, pad=(1, 0))
+    attention_scores = attention_scores.view(batch_size, num_heads, -1, query_length)
+    attention_scores = attention_scores[:, :, 1:].view(
+        batch_size,
+        num_heads,
+        query_length,
+        position_length,
+    )
+    return attention_scores
+
+
+def _nemotron_eager_attention(
+    query_states_with_bias_u: torch.Tensor,
+    query_states_with_bias_v: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    relative_key_states: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+) -> torch.Tensor:
+    matrix_ac = query_states_with_bias_u @ key_states.transpose(-2, -1)
+    matrix_bd = query_states_with_bias_v @ relative_key_states.transpose(-2, -1)
+    matrix_bd = _nemotron_rel_shift(matrix_bd)
+    matrix_bd = matrix_bd[..., : query_states_with_bias_u.shape[-2]]
+    attention_scores = (matrix_ac + matrix_bd) * scaling
+    if attention_mask is not None:
+        attention_scores = attention_scores.masked_fill(
+            attention_mask.logical_not(),
+            float("-inf"),
+        )
+    attention_probs = torch.softmax(attention_scores.float(), dim=-1).to(
+        value_states.dtype
+    )
+    return attention_probs @ value_states
+
+
+def _nemotron_sdpa_attention(
+    query_states_with_bias_u: torch.Tensor,
+    query_states_with_bias_v: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    relative_key_states: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+) -> torch.Tensor:
+    matrix_bd = query_states_with_bias_v @ relative_key_states.transpose(-2, -1)
+    matrix_bd = _nemotron_rel_shift(matrix_bd)
+    matrix_bd = matrix_bd[..., : query_states_with_bias_u.shape[-2]]
+    matrix_bd = matrix_bd * scaling
+    if attention_mask is not None:
+        matrix_bd = matrix_bd.masked_fill(attention_mask.logical_not(), float("-inf"))
+    return F.scaled_dot_product_attention(
+        query_states_with_bias_u,
+        key_states,
+        value_states,
+        attn_mask=matrix_bd,
+        dropout_p=0.0,
+        scale=scaling,
+    )
+
+
+class NemotronASRAttention(nn.Module):
+    def __init__(self, attention: nn.Module) -> None:
+        super().__init__()
+        self.config = attention.config
+        self.head_dim = attention.head_dim
+        self.scaling = attention.scaling
+        self.attention_dropout = attention.attention_dropout
+        self.q_proj = attention.q_proj
+        self.k_proj = attention.k_proj
+        self.v_proj = attention.v_proj
+        self.o_proj = attention.o_proj
+        self.relative_k_proj = attention.relative_k_proj
+        self.bias_u = attention.bias_u
+        self.bias_v = attention.bias_v
+        self._compiled_cuda_attention = None
+
+    @staticmethod
+    def _cuda_compile_enabled() -> bool:
+        setting = os.environ.get(
+            "NEMOTRON_ASR_CUDA_COMPILE_ATTENTION",
+            "1",
+        ).lower()
+        return setting not in {"0", "false", "off", "no"}
+
+    def _attention(
+        self,
+        query_states_with_bias_u: torch.Tensor,
+        query_states_with_bias_v: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        relative_key_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if (
+            query_states_with_bias_u.device.type == "cuda"
+            and self._cuda_compile_enabled()
+        ):
+            if self._compiled_cuda_attention is None:
+                self._compiled_cuda_attention = torch.compile(
+                    _nemotron_sdpa_attention,
+                    mode="reduce-overhead",
+                    fullgraph=False,
+                )
+            return self._compiled_cuda_attention(
+                query_states_with_bias_u,
+                query_states_with_bias_v,
+                key_states,
+                value_states,
+                relative_key_states,
+                attention_mask,
+                self.scaling,
+            )
+        return _nemotron_eager_attention(
+            query_states_with_bias_u,
+            query_states_with_bias_v,
+            key_states,
+            value_states,
+            relative_key_states,
+            attention_mask,
+            self.scaling,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, None]:
+        del kwargs
+        input_shape = hidden_states.shape[:-1]
+        batch_size, seq_length = input_shape
+        hidden_shape = (batch_size, seq_length, -1, self.head_dim)
+
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        query_states_with_bias_u = query_states + self.bias_u.view(
+            1,
+            self.config.num_attention_heads,
+            1,
+            self.head_dim,
+        )
+        query_states_with_bias_v = query_states + self.bias_v.view(
+            1,
+            self.config.num_attention_heads,
+            1,
+            self.head_dim,
+        )
+
+        relative_key_states = self.relative_k_proj(position_embeddings)
+        relative_key_states = relative_key_states.view(
+            batch_size,
+            -1,
+            self.config.num_attention_heads,
+            self.head_dim,
+        ).transpose(1, 2)
+
+        attn_output = self._attention(
+            query_states_with_bias_u,
+            query_states_with_bias_v,
+            key_states,
+            value_states,
+            relative_key_states,
+            attention_mask,
+        )
+        attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, None
+
+
 class NemotronASRCausalConv2D(nn.Conv2d):
     def __init__(
         self,
@@ -297,7 +474,55 @@ class NemotronASRCausalConv2D(nn.Conv2d):
         self.right_padding = stride - 1
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        padded = F.pad(input, pad=(self.left_padding, self.right_padding, 0, 0))
+        padded = F.pad(
+            input,
+            pad=(
+                self.left_padding,
+                self.right_padding,
+                self.left_padding,
+                self.right_padding,
+            ),
+        )
+        return super().forward(padded)
+
+
+class NemotronASRCausalConv1D(nn.Conv1d):
+    def __init__(self, conv: nn.Conv1d) -> None:
+        kernel_size = conv.kernel_size[0]
+        super().__init__(
+            in_channels=conv.in_channels,
+            out_channels=conv.out_channels,
+            kernel_size=conv.kernel_size,
+            stride=conv.stride,
+            padding=0,
+            dilation=conv.dilation,
+            groups=conv.groups,
+            bias=conv.bias is not None,
+            padding_mode=conv.padding_mode,
+        )
+        self.left_padding = kernel_size - 1
+        self.right_padding = 0
+
+    def _uses_manual_depthwise_kernel(self, device_type: str) -> bool:
+        return (
+            device_type != "cuda"
+            and self.bias is None
+            and self.groups == self.in_channels == self.out_channels
+            and self.stride == (1,)
+            and self.dilation == (1,)
+        )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        padded = F.pad(input, pad=(self.left_padding, self.right_padding))
+        if self._uses_manual_depthwise_kernel(input.device.type):
+            output = input.new_zeros(input.shape)
+            weights = self.weight[:, 0, :]
+            for kernel_idx in range(self.kernel_size[0]):
+                output = output + (
+                    padded[:, :, kernel_idx : kernel_idx + input.shape[-1]]
+                    * weights[:, kernel_idx][None, :, None]
+                )
+            return output
         return super().forward(padded)
 
 
@@ -376,6 +601,24 @@ class NemotronASRBatchNorm1dNoStats(nn.Module):
         return output * self.weight[None, :, None] + self.bias[None, :, None]
 
 
+class NemotronASRConvLayerNorm(nn.Module):
+    def __init__(self, num_features: int, eps: float) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+        self.eps = eps
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        normalized = F.layer_norm(
+            input.transpose(1, 2),
+            (input.shape[1],),
+            self.weight,
+            self.bias,
+            self.eps,
+        )
+        return normalized.transpose(1, 2)
+
+
 class NemotronASREncoder(ParakeetEncoder):
     def __init__(self, config) -> None:
         super().__init__(config)
@@ -397,6 +640,13 @@ class NemotronASREncoder(ParakeetEncoder):
             padding_mode=conv.padding_mode,
         )
 
+    def _patch_nemo_attention_modules(self) -> None:
+        for layer in self.layers:
+            attention = getattr(layer, "self_attn", None)
+            if attention is None or isinstance(attention, NemotronASRAttention):
+                continue
+            layer.self_attn = NemotronASRAttention(attention)
+
     def _patch_nemo_convolution_modules(self) -> None:
         for layer in self.layers:
             conv_module = getattr(layer, "conv", None)
@@ -411,12 +661,74 @@ class NemotronASREncoder(ParakeetEncoder):
                 if isinstance(conv, nn.Conv1d) and conv.bias is not None:
                     setattr(conv_module, conv_name, self._conv1d_without_bias(conv))
 
+            depthwise_conv = getattr(conv_module, "depthwise_conv", None)
+            if bool(getattr(self.config, "conv_causal", False)) and isinstance(
+                depthwise_conv, nn.Conv1d
+            ):
+                conv_module.depthwise_conv = NemotronASRCausalConv1D(depthwise_conv)
+
             norm = getattr(conv_module, "norm", None)
-            if isinstance(norm, nn.BatchNorm1d):
+            conv_norm_type = getattr(self.config, "conv_norm_type", "batch_norm")
+            if conv_norm_type == "layer_norm" and isinstance(norm, nn.BatchNorm1d):
+                conv_module.norm = NemotronASRConvLayerNorm(
+                    norm.num_features,
+                    eps=norm.eps,
+                )
+            elif isinstance(norm, nn.BatchNorm1d):
                 conv_module.norm = NemotronASRBatchNorm1dNoStats(
                     norm.num_features,
                     eps=norm.eps,
                 )
+
+    def _get_nemo_attention_mask(
+        self,
+        attention_mask: torch.Tensor,
+        *,
+        target_length: int,
+    ) -> torch.Tensor:
+        valid_mask = self._get_output_attention_mask(
+            attention_mask,
+            target_length=target_length,
+        )
+        pairwise_mask = valid_mask[:, None, :] & valid_mask[:, :, None]
+
+        context_mask = torch.ones(
+            target_length,
+            target_length,
+            dtype=torch.bool,
+            device=attention_mask.device,
+        )
+        att_context_left = int(getattr(self.config, "att_context_left", -1))
+        att_context_right = int(getattr(self.config, "att_context_right", -1))
+        att_context_style = getattr(self.config, "att_context_style", "regular")
+
+        if att_context_style == "regular":
+            if att_context_left >= 0:
+                context_mask = context_mask.triu(diagonal=-att_context_left)
+            if att_context_right >= 0:
+                context_mask = context_mask.tril(diagonal=att_context_right)
+        elif att_context_style == "chunked_limited":
+            if att_context_right == -1:
+                if att_context_left >= 0:
+                    context_mask = context_mask.triu(diagonal=-att_context_left)
+            else:
+                chunk_size = att_context_right + 1
+                left_chunks = (
+                    att_context_left // chunk_size if att_context_left >= 0 else 10000
+                )
+                chunk_idx = torch.div(
+                    torch.arange(
+                        target_length,
+                        dtype=torch.int,
+                        device=attention_mask.device,
+                    ),
+                    chunk_size,
+                    rounding_mode="trunc",
+                )
+                diff_chunks = chunk_idx.unsqueeze(1) - chunk_idx.unsqueeze(0)
+                context_mask = (diff_chunks <= left_chunks) & (diff_chunks >= 0)
+
+        return (pairwise_mask & context_mask.unsqueeze(0)).unsqueeze(1)
 
     def _get_subsampling_output_length(self, input_lengths: torch.Tensor):
         if not bool(getattr(self.config, "causal_downsampling", False)):
@@ -425,11 +737,64 @@ class NemotronASREncoder(ParakeetEncoder):
         kernel_size = self.config.subsampling_conv_kernel_size
         stride = self.config.subsampling_conv_stride
         num_layers = int(math.log2(self.config.subsampling_factor))
+        all_padding = (kernel_size - 1) + (stride - 1)
+        add_padding = all_padding - kernel_size
         lengths = input_lengths.to(dtype=torch.float)
         for _ in range(num_layers):
-            lengths = torch.div(lengths - kernel_size, stride, rounding_mode="floor")
-            lengths = lengths + 1
+            lengths = (
+                torch.div(
+                    lengths + add_padding,
+                    stride,
+                    rounding_mode="floor",
+                )
+                + 1
+            )
         return lengths.clamp_min(0).to(dtype=torch.int)
+
+    def forward(
+        self,
+        input_features: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> BaseModelOutput:
+        hidden_states = self.subsampling(input_features, attention_mask)
+        hidden_states = hidden_states * self.input_scale
+        position_embeddings = self.encode_positions(hidden_states)
+
+        hidden_states = nn.functional.dropout(
+            hidden_states,
+            p=self.dropout,
+            training=self.training,
+        )
+        position_embeddings = nn.functional.dropout(
+            position_embeddings,
+            p=self.dropout_positions,
+            training=self.training,
+        )
+
+        encoder_attention_mask = None
+        if attention_mask is not None:
+            encoder_attention_mask = self._get_nemo_attention_mask(
+                attention_mask,
+                target_length=hidden_states.shape[1],
+            )
+
+        for encoder_layer in self.layers:
+            to_drop = False
+            if self.training:
+                dropout_probability = torch.rand([])
+                if dropout_probability < self.layerdrop:
+                    to_drop = True
+
+            if not to_drop:
+                hidden_states = encoder_layer(
+                    hidden_states,
+                    attention_mask=encoder_attention_mask,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+
+        return BaseModelOutput(last_hidden_state=hidden_states)
 
 
 class NemotronASRModel(nn.Module):
@@ -438,37 +803,153 @@ class NemotronASRModel(nn.Module):
         config: NemotronASRConfig = vllm_config.model_config.hf_config
         self.config = config
         self.dtype = vllm_config.model_config.dtype
+        self._use_cuda_cpu_decoder = self._should_use_cuda_cpu_decoder()
+        self._use_mps_encoder_hybrid = self._should_use_mps_encoder_hybrid(self.dtype)
+        self._mps_encoder_dtype = self._get_mps_encoder_dtype()
+        self._mps_encoder_hybrid_ready = False
 
         self.encoder = NemotronASREncoder(config.encoder_config).to(self.dtype)
-        self.prompt_kernel = nn.Sequential(
-            nn.Linear(
-                config.encoder_config.hidden_size + config.prompt_dim,
-                config.encoder_config.hidden_size * 2,
-            ),
-            nn.ReLU(),
-            nn.Linear(
-                config.encoder_config.hidden_size * 2,
-                config.encoder_config.hidden_size,
-            ),
+        self.prompt_kernel = (
+            nn.Sequential(
+                nn.Linear(
+                    config.encoder_config.hidden_size + config.prompt_dim,
+                    config.encoder_config.hidden_size * 2,
+                ),
+                nn.ReLU(),
+                nn.Linear(
+                    config.encoder_config.hidden_size * 2,
+                    config.encoder_config.hidden_size,
+                ),
+            )
+            if config.prompt_dim > 0
+            else None
         )
+        if self.prompt_kernel is not None:
+            self.prompt_kernel = self.prompt_kernel.to(self.dtype)
         self.encoder_projector = nn.Linear(
             config.encoder_config.hidden_size,
             config.decoder_hidden_size,
-        )
+        ).to(self.dtype)
         self.decoder = TransducerPredictionDecoder(
             vocab_size=config.vocab_size,
             hidden_size=config.decoder_hidden_size,
             num_layers=config.num_decoder_layers,
+        ).to(self.dtype)
+        self.joint = NemotronASRJoint(config).to(self.dtype)
+
+    @staticmethod
+    def _should_use_cuda_cpu_decoder() -> bool:
+        setting = os.environ.get("NEMOTRON_ASR_CUDA_DECODER_DEVICE", "auto").lower()
+        if setting in {"cuda", "gpu", "0", "false", "off", "no"}:
+            return False
+        if setting in {"cpu", "1", "true", "on", "yes", "auto"}:
+            return True
+        logger.warning(
+            "Unknown NEMOTRON_ASR_CUDA_DECODER_DEVICE=%r; using auto.",
+            setting,
         )
-        self.joint = NemotronASRJoint(config)
+        return True
+
+    @staticmethod
+    def _should_use_mps_encoder_hybrid(dtype: torch.dtype) -> bool:
+        setting = os.environ.get("NEMOTRON_ASR_MPS_ENCODER", "auto").lower()
+        if setting in {"0", "false", "off", "no"}:
+            return False
+        if setting not in {"1", "true", "on", "yes", "auto"}:
+            logger.warning(
+                "Unknown NEMOTRON_ASR_MPS_ENCODER=%r; using auto.",
+                setting,
+            )
+        if dtype != torch.float32:
+            return False
+        mps_backend = getattr(torch.backends, "mps", None)
+        return bool(
+            mps_backend is not None
+            and mps_backend.is_available()
+            and torch.backends.mps.is_built()
+        )
+
+    @staticmethod
+    def _get_mps_encoder_dtype() -> torch.dtype:
+        setting = os.environ.get("NEMOTRON_ASR_MPS_ENCODER_DTYPE", "float16").lower()
+        if setting in {"fp16", "float16", "half"}:
+            return torch.float16
+        if setting in {"fp32", "float32", "full"}:
+            return torch.float32
+        logger.warning(
+            "Unknown NEMOTRON_ASR_MPS_ENCODER_DTYPE=%r; using float16.",
+            setting,
+        )
+        return torch.float16
+
+    def _decoder_device(self) -> torch.device:
+        return self.encoder_projector.weight.device
+
+    def _move_decoder_stack(self, device: torch.device) -> None:
+        if self.prompt_kernel is not None:
+            self.prompt_kernel.to(device)
+        self.encoder_projector.to(device)
+        self.decoder.to(device)
+        self.joint.to(device)
+
+    def _prepare_encoder_decode_devices(
+        self,
+        input_device: torch.device,
+    ) -> tuple[torch.device, torch.device]:
+        if input_device.type == "cuda":
+            self.encoder._patch_nemo_attention_modules()
+            encoder_device = next(self.encoder.parameters()).device
+            if self._use_cuda_cpu_decoder:
+                decoder_device = torch.device("cpu")
+                if self._decoder_device().type != decoder_device.type:
+                    logger.info(
+                        "Using Nemotron ASR CUDA encoder with CPU RNN-T decoder."
+                    )
+                    self._move_decoder_stack(decoder_device)
+                return encoder_device, decoder_device
+            if self._decoder_device().type != encoder_device.type:
+                self._move_decoder_stack(encoder_device)
+            return encoder_device, self._decoder_device()
+        if not self._use_mps_encoder_hybrid:
+            encoder_device = next(self.encoder.parameters()).device
+            return encoder_device, self._decoder_device()
+
+        encoder_device = torch.device("mps")
+        decoder_device = torch.device("cpu")
+        encoder_current_device = next(self.encoder.parameters()).device
+        if (
+            not self._mps_encoder_hybrid_ready
+            or encoder_current_device.type != encoder_device.type
+            or next(self.encoder.parameters()).dtype != self._mps_encoder_dtype
+            or self._decoder_device().type != decoder_device.type
+        ):
+            logger.info(
+                "Using Nemotron ASR hybrid local execution: encoder on MPS "
+                "%s, RNN-T decoder on CPU.",
+                str(self._mps_encoder_dtype).replace("torch.", ""),
+            )
+            self.encoder.to(device=encoder_device, dtype=self._mps_encoder_dtype)
+            self._move_decoder_stack(decoder_device)
+            self._mps_encoder_hybrid_ready = True
+        return encoder_device, decoder_device
 
     def get_encoder_outputs(
         self,
         input_features: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> list[torch.Tensor]:
+        encoder_device, decoder_device = self._prepare_encoder_decode_devices(
+            input_features.device
+        )
+        encoder_dtype = (
+            self._mps_encoder_dtype
+            if self._use_mps_encoder_hybrid and encoder_device.type == "mps"
+            else self.dtype
+        )
+        input_features = input_features.to(device=encoder_device, dtype=encoder_dtype)
+        attention_mask = attention_mask.to(device=encoder_device)
         encoder_outputs = self.encoder(
-            input_features=input_features.to(self.dtype),
+            input_features=input_features,
             attention_mask=attention_mask,
         )
         hidden_states = encoder_outputs.last_hidden_state
@@ -480,7 +961,19 @@ class NemotronASRModel(nn.Module):
             )
 
         if output_mask is None:
+            if hidden_states.device != decoder_device:
+                hidden_states = hidden_states.to(
+                    device=decoder_device,
+                    dtype=self.dtype,
+                )
             return list(hidden_states)
+
+        if hidden_states.device != decoder_device:
+            hidden_states = hidden_states.to(
+                device=decoder_device,
+                dtype=self.dtype,
+            )
+            output_mask = output_mask.to(decoder_device)
 
         return [
             hidden_state[mask.to(dtype=torch.bool)]
@@ -504,6 +997,8 @@ class NemotronASRModel(nn.Module):
                 dtype=torch.long,
                 device=device,
             )
+        if self.prompt_kernel is None or self.config.prompt_dim <= 0:
+            return self.encoder_projector(padded_outputs)
         prompt_one_hot = torch.nn.functional.one_hot(
             prompt_ids.to(device=device),
             num_classes=self.config.prompt_dim,

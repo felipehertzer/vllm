@@ -217,10 +217,14 @@ class ParakeetExtractor:
     def _normalize_mel_features(
         self, mel_features: torch.Tensor, audio_lengths: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        features_lengths = torch.floor_divide(
-            audio_lengths + self.config.n_fft // 2 * 2 - self.config.n_fft,
-            self.config.hop_length,
+        features_lengths = (
+            torch.floor_divide(
+                audio_lengths + self.config.n_fft // 2 * 2 - self.config.n_fft,
+                self.config.hop_length,
+            )
+            + 1
         )
+        features_lengths = torch.clamp(features_lengths, max=mel_features.shape[1])
         attention_mask = (
             torch.arange(mel_features.shape[1], device=mel_features.device)[None, :]
             < features_lengths[:, None]
