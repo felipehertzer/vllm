@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: int = 25
     VLLM_MAX_AUDIO_DECODE_DURATION_S: int = 600
     VLLM_MAX_AUDIO_PREPROCESS_WORKERS: int = max(1, min(os.cpu_count() or 1, 2))
+    VLLM_MPS_PROFILE: bool = False
     VLLM_VIDEO_LOADER_BACKEND: str = "opencv"
     VLLM_MEDIA_CONNECTOR: str = "http"
     VLLM_MM_HASHER_ALGORITHM: str = "blake3"
@@ -555,8 +556,10 @@ def _resolve_rust_frontend_path() -> str | None:
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
-    # rocm, cpu]
+    # rocm, xpu, cpu, mps]
     "VLLM_TARGET_DEVICE": lambda: os.getenv("VLLM_TARGET_DEVICE", "cuda").lower(),
+    # Enable coarse MPS runner phase timings for local optimization.
+    "VLLM_MPS_PROFILE": lambda: bool(int(os.getenv("VLLM_MPS_PROFILE", "0"))),
     # Main CUDA version of vLLM. This follows PyTorch but can be overridden.
     "VLLM_MAIN_CUDA_VERSION": lambda: (
         os.getenv("VLLM_MAIN_CUDA_VERSION", "").lower() or "13.0"
@@ -1579,10 +1582,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS", "1")
     ),
     # Enforce function parameter schemas in structural-tag based tool calling.
-    "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: os.getenv(
-        "VLLM_ENFORCE_STRICT_TOOL_CALLING", "True"
-    ).lower()
-    in ("true", "1"),
+    "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: (
+        os.getenv("VLLM_ENFORCE_STRICT_TOOL_CALLING", "True").lower() in ("true", "1")
+    ),
     # Control the max chunk bytes (in MB) for the rpc message queue.
     # Object larger than this threshold will be broadcast to worker
     # processes via zmq.

@@ -2392,6 +2392,16 @@ class EngineArgs:
                 UsageContext.OPENAI_API_SERVER: 128 * world_size,
             }
 
+        if current_platform.is_mps():
+            default_max_num_batched_tokens = {
+                UsageContext.LLM_CLASS: 4096,
+                UsageContext.OPENAI_API_SERVER: 2048,
+            }
+            default_max_num_seqs = {
+                UsageContext.LLM_CLASS: 4,
+                UsageContext.OPENAI_API_SERVER: 4,
+            }
+
         return default_max_num_batched_tokens, default_max_num_seqs
 
     def _set_default_chunked_prefill_and_prefix_caching_args(

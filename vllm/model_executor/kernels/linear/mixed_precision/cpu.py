@@ -5,6 +5,7 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm import envs
+from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     pack_quantized_values_into_int32,
     unpack_quantized_values_into_int32,
@@ -15,6 +16,10 @@ from vllm.scalar_type import scalar_types
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 _CPUWNA16_SUPPORTED_QUANT_TYPES = (scalar_types.uint4, scalar_types.uint4b8)
+
+
+def _cpu_wna16_op_available() -> bool:
+    return hasattr(torch.ops._C, "cpu_gemm_wna16")
 
 
 class CPUWNA16LinearKernel(MPLinearKernel):
@@ -57,6 +62,56 @@ class CPUWNA16LinearKernel(MPLinearKernel):
             )
 
         return True, None
+
+    def _process_gptq_weights_torch(self, layer: torch.nn.Module):
+        packed_weight = getattr(layer, self.w_q_name)
+        if packed_weight.input_dim == 1:
+            packed_weight.data = packed_weight.t()
+
+        scales = getattr(layer, self.w_s_name)
+        if scales.output_dim == 0:
+            scales.data = scales.t().contiguous()
+
+        qweight = unpack_quantized_values_into_int32(
+            packed_weight, self.config.weight_type, 0
+        ).to(torch.float32)
+        if self.config.weight_type.has_bias():
+            qweight.sub_(self.config.weight_type.bias)
+
+        k_size = qweight.shape[0]
+        group_size = self.config.group_size
+        if group_size == -1:
+            group_size = k_size
+
+        if self.config.has_g_idx and self.w_gidx_name is not None:
+            g_idx = getattr(layer, self.w_gidx_name).to(torch.long)
+        else:
+            g_idx = torch.arange(k_size, device=qweight.device, dtype=torch.long)
+            g_idx.div_(group_size, rounding_mode="floor")
+
+        scales_by_input = scales.to(torch.float32).index_select(0, g_idx)
+
+        if self.config.zero_points:
+            assert self.w_zp_name is not None
+            packed_zp = getattr(layer, self.w_zp_name)
+            zeros = unpack_quantized_values_into_int32(
+                packed_zp, self.config.weight_type, 1
+            ).to(torch.float32)
+            zeros_by_input = zeros.index_select(0, g_idx)
+            qweight.sub_(zeros_by_input)
+
+        dense_weight = qweight.mul_(scales_by_input).to(self.config.act_type)
+        replace_parameter(
+            layer,
+            self.w_q_name,
+            torch.nn.Parameter(dense_weight.contiguous(), requires_grad=False),
+        )
+        setattr(layer, self.w_s_name, None)
+        if self.w_zp_name is not None:
+            setattr(layer, self.w_zp_name, None)
+        if self.w_gidx_name is not None:
+            setattr(layer, self.w_gidx_name, None)
+        layer.use_torch_wna16 = True
 
     # note assumes that
     #  `weight_packed` is: {input_dim = 0, output_dim = 1, packed_dim = 0}
@@ -141,6 +196,10 @@ class CPUWNA16LinearKernel(MPLinearKernel):
         packed_zp.data = blocked_zp
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        if not _cpu_wna16_op_available():
+            self._process_gptq_weights_torch(layer)
+            return
+
         if (not self.config.zero_points) and (self.w_zp_name is not None):
             setattr(layer, self.w_zp_name, None)
 
@@ -187,6 +246,14 @@ class CPUWNA16LinearKernel(MPLinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "use_torch_wna16", False):
+            weight = getattr(layer, self.w_q_name)
+            x_2d = x.reshape(-1, x.shape[-1]).to(weight.dtype)
+            output = torch.matmul(x_2d, weight)
+            if bias is not None:
+                output = output + bias.to(output.dtype)
+            return output.reshape(x.shape[:-1] + (weight.shape[1],))
+
         w_q, w_s, w_zp, w_gidx = self._get_weight_params(layer)
         if layer.use_w4a8:
             x = ops.int4_scaled_mm_cpu(

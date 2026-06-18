@@ -47,6 +47,20 @@ def _check_consistency(target: TokenizerLike, expected: TokenizerLike):
     assert target.encode("prompt") == expected.encode("prompt")
 
 
+def test_cached_tokenizer_supports_qwen2_without_extended_special_tokens():
+    """Transformers 5 Qwen2 tokenizers no longer expose
+    all_special_tokens_extended; vLLM should not require it.
+    """
+    reference_tokenizer = AutoTokenizer.from_pretrained(
+        "ramgpt/jan-nano-4b-gptqmodel-4bit"
+    )
+    assert reference_tokenizer.__class__.__name__ == "Qwen2Tokenizer"
+    assert not hasattr(reference_tokenizer, "all_special_tokens_extended")
+
+    cached_tokenizer = get_cached_tokenizer(deepcopy(reference_tokenizer))
+    _check_consistency(cached_tokenizer, reference_tokenizer)
+
+
 @pytest.mark.parametrize("model_id", ["gpt2"])
 def test_thread_pool_tokenizer_pickle(model_id: str):
     """Regression test for issue #45433: the thread-pool tokenizer wrapper

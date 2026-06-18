@@ -479,6 +479,19 @@ struct FP32Vec16 : public VectorizedRegWrapper<FP32Vec16, 4, float> {
     reg.val[3] = data.reg.val[1];
   };
 
+  explicit FP32Vec16(int64_t value, const FP32Vec16& lut) {
+    alignas(64) float lut_values[VEC_ELEM_NUM];
+    alignas(64) float out_values[VEC_ELEM_NUM];
+    lut.save(lut_values);
+
+    const uint64_t q_values = static_cast<uint64_t>(value);
+    for (int i = 0; i < VEC_ELEM_NUM; ++i) {
+      const uint64_t idx = (q_values >> (i * 4)) & 0xF;
+      out_values[i] = lut_values[idx];
+    }
+    reg.load(out_values);
+  };
+
   explicit FP32Vec16(const BF16Vec16& v) {
     std::tie(reg.val[0], reg.val[1]) = convert_bfloat16_float(v.reg.val[0]);
     std::tie(reg.val[2], reg.val[3]) = convert_bfloat16_float(v.reg.val[1]);
@@ -921,6 +934,30 @@ inline void fma(FP32Vec16& acc, BF16Vec32& a, BF16Vec32& b) {
   fmadd(acc.reg.val[2], a1_low, b1_low);
   fmadd(acc.reg.val[3], a1_high, b1_high);
 };
+
+template <typename VecT>
+static void interleave_save_16b(const VecT& vec0, const VecT& vec1, void* ptr) {
+  alignas(64) uint16_t values0[VecT::VEC_ELEM_NUM];
+  alignas(64) uint16_t values1[VecT::VEC_ELEM_NUM];
+  vec0.save(values0);
+  vec1.save(values1);
+
+  auto* packed = reinterpret_cast<uint32_t*>(ptr);
+  for (int i = 0; i < VecT::VEC_ELEM_NUM; ++i) {
+    packed[i] = static_cast<uint32_t>(values0[i]) |
+                (static_cast<uint32_t>(values1[i]) << 16);
+  }
+}
+
+static void interleave_save(const FP16Vec16& vec0, const FP16Vec16& vec1,
+                            void* ptr) {
+  interleave_save_16b(vec0, vec1, ptr);
+}
+
+static void interleave_save(const BF16Vec16& vec0, const BF16Vec16& vec1,
+                            void* ptr) {
+  interleave_save_16b(vec0, vec1, ptr);
+}
 
 template <>
 inline void storeFP32<c10::BFloat16>(float v, c10::BFloat16* ptr) {

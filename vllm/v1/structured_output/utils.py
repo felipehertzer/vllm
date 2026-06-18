@@ -148,6 +148,13 @@ def apply_grammar_bitmask(
     # since the bitmask is already aligned with the logits.
     skip_out_indices = len(out_indices) == logits.shape[0]
 
+    if logits.device.type == "mps":
+        _apply_grammar_bitmask_torch(logits, grammar_bitmask)
+        # MPS does not participate in the CUDA stream synchronization used by
+        # the GPU runner. Make the masked logits visible before sampling.
+        torch.mps.synchronize()
+        return
+
     if not logits.is_cpu:
         index_tensor = None
         if not skip_out_indices:
@@ -175,6 +182,18 @@ def apply_grammar_bitmask(
         logits.copy_(logits_fp32.to(logits.dtype))
     else:
         xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, indices=indices)
+
+
+def _apply_grammar_bitmask_torch(
+    logits: torch.Tensor, grammar_bitmask: torch.Tensor
+) -> None:
+    vocab_size = logits.shape[-1]
+    shifts = torch.arange(32, dtype=torch.int32, device=logits.device)
+    unpacked = ((grammar_bitmask.unsqueeze(-1) >> shifts) & 1).reshape(
+        grammar_bitmask.shape[0], -1
+    )
+    allowed = unpacked[:, :vocab_size].to(dtype=torch.bool)
+    logits.masked_fill_(~allowed, -float("inf"))
 
 
 class OutlinesVocabulary:

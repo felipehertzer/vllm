@@ -941,6 +941,7 @@ class VllmConfig:
                     model_type,
                 )
 
+        from vllm.platforms import current_platform
         from vllm.v1.executor.abstract import Executor
 
         executor_backend = self.parallel_config.distributed_executor_backend
@@ -948,6 +949,10 @@ class VllmConfig:
         executor_supports_async_sched = executor_class.supports_async_scheduling()
 
         if self.scheduler_config.async_scheduling:
+            if current_platform.is_mps():
+                raise ValueError(
+                    "Async scheduling uses CUDA streams and is not supported on MPS."
+                )
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             # Currently, async scheduling only support eagle speculative
             # decoding.
@@ -973,7 +978,10 @@ class VllmConfig:
                 )
         elif self.scheduler_config.async_scheduling is None:
             # Enable async scheduling unless there is an incompatible option.
-            if (
+            if current_platform.is_mps():
+                logger.debug("Disabling asynchronous scheduling by default on MPS.")
+                self.scheduler_config.async_scheduling = False
+            elif (
                 self.model_config is not None
                 and self.model_config.runner_type == "pooling"
             ):
