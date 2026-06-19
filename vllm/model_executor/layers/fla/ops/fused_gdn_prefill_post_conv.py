@@ -12,6 +12,7 @@ and writes directly to q/k/v/g/beta in the target contiguous layout.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from vllm.triton_utils import tl, triton
 
@@ -191,9 +192,9 @@ def fused_post_conv_prep(
     dtype = conv_output.dtype
     device = conv_output.device
 
-    assert qkv_dim == 2 * H * K + HV * V, (
-        f"qkv_dim={qkv_dim} != 2*H*K + HV*V = {2 * H * K + HV * V}"
-    )
+    assert (
+        qkv_dim == 2 * H * K + HV * V
+    ), f"qkv_dim={qkv_dim} != 2*H*K + HV*V = {2 * H * K + HV * V}"
 
     # Allocate outputs in target contiguous layout
     q = torch.empty(L, H, K, dtype=dtype, device=device)
@@ -203,6 +204,25 @@ def fused_post_conv_prep(
     beta = torch.empty(L, HV, dtype=torch.float32, device=device)
 
     if L == 0:
+        return q, k, v, g, beta
+
+    if device.type != "cuda":
+        q_flat, k_flat, v_flat = torch.split(
+            conv_output, [H * K, H * K, HV * V], dim=-1
+        )
+        q = q_flat.reshape(L, H, K).contiguous()
+        k = k_flat.reshape(L, H, K).contiguous()
+        v = v_flat.reshape(L, HV, V).contiguous()
+
+        if apply_l2norm:
+            q = F.normalize(q.float(), p=2, dim=-1, eps=1e-6).to(dtype)
+            k = F.normalize(k.float(), p=2, dim=-1, eps=1e-6).to(dtype)
+
+        x = a.float() + dt_bias.float()
+        g = -torch.exp(A_log.float()) * F.softplus(x, beta=1.0, threshold=20.0)
+        if output_g_exp:
+            g = torch.exp(g)
+        beta = torch.sigmoid(b.float())
         return q, k, v, g, beta
 
     # ---- Kernel config ----

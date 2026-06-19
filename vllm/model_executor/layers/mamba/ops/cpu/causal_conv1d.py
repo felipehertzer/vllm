@@ -14,9 +14,11 @@ def causal_conv1d_torch(
     bias: torch.Tensor | None,
     conv_states: torch.Tensor,
     query_start_loc: torch.Tensor,
-    cache_indices: torch.Tensor,
-    has_initial_state: torch.Tensor,
+    cache_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
     activation: str | None = "silu",
+    pad_slot_id: int | None = None,
+    null_block_id: int | None = None,
 ) -> torch.Tensor:
     out = torch.empty_like(x)
     state_len = weight.shape[1] - 1
@@ -28,10 +30,22 @@ def causal_conv1d_torch(
     ]
     weight = weight.unsqueeze(1)
     for seq_idx, (bos, eos) in enumerate(seq_begin_end_idx):
-        slot = int(cache_indices[seq_idx].item())
+        if cache_indices is None:
+            slot = seq_idx
+        elif cache_indices.dim() == 1:
+            slot = int(cache_indices[seq_idx].item())
+        else:
+            slot = int(cache_indices[seq_idx, 0].item())
+
+        if slot in {pad_slot_id, null_block_id}:
+            out[:, bos:eos].zero_()
+            continue
 
         seq_x = x[:, bos:eos].unsqueeze(0)
-        if bool(has_initial_state[seq_idx].item()):
+        has_state = has_initial_state is not None and bool(
+            has_initial_state[seq_idx].item()
+        )
+        if has_state:
             initial_state = conv_states[slot, :, :state_len].unsqueeze(0)
         else:
             initial_state = torch.zeros(

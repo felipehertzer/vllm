@@ -6,6 +6,7 @@ import functools
 from typing import Literal
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 
@@ -81,6 +82,79 @@ if GDN_AITER_TRITON_AVAILABLE:
     )
 
 logger = init_logger(__name__)
+
+
+def _torch_gated_delta_rule(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    core_attn_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Portable eager implementation used by non-Triton backends such as MPS."""
+    if cu_seqlens is not None and q.shape[0] != 1:
+        raise ValueError("cu_seqlens fallback expects flattened batch size 1.")
+
+    if use_qk_l2norm_in_kernel:
+        q = F.normalize(q.float(), p=2, dim=-1, eps=1e-6).to(q.dtype)
+        k = F.normalize(k.float(), p=2, dim=-1, eps=1e-6).to(k.dtype)
+
+    B, T, H, K = q.shape
+    HV = v.shape[2]
+    V = v.shape[3]
+    N = B if cu_seqlens is None else int(cu_seqlens.numel()) - 1
+    scale = K**-0.5
+
+    final_state_dtype = initial_state.dtype if initial_state is not None else v.dtype
+    if initial_state is None:
+        state = torch.zeros(N, HV, V, K, dtype=torch.float32, device=q.device)
+    else:
+        state = initial_state.float().clone()
+
+    out = torch.empty(B, T, HV, V, dtype=v.dtype, device=v.device)
+    head_group = max(HV // H, 1)
+    head_indices = (torch.arange(HV, device=q.device) // head_group).clamp(max=H - 1)
+
+    for seq_idx in range(N):
+        if cu_seqlens is None:
+            start = seq_idx * T
+            end = start + T
+            batch_idx = seq_idx
+        else:
+            start = int(cu_seqlens[seq_idx].item())
+            end = int(cu_seqlens[seq_idx + 1].item())
+            batch_idx = 0
+
+        seq_state = state[seq_idx]
+        for flat_pos in range(start, end):
+            token_idx = flat_pos - start if cu_seqlens is None else flat_pos
+            q_t = q[batch_idx, token_idx].float().index_select(0, head_indices)
+            k_t = k[batch_idx, token_idx].float().index_select(0, head_indices)
+            v_t = v[batch_idx, token_idx].float()
+            g_t = g[batch_idx, token_idx].float()
+            beta_t = beta[batch_idx, token_idx].float()
+            if beta_t.ndim == 1:
+                beta_t = beta_t.unsqueeze(-1)
+
+            seq_state.mul_(torch.exp(g_t).view(HV, 1, 1))
+            pred_v = torch.sum(seq_state * k_t[:, None, :], dim=-1)
+            delta_v = (v_t - pred_v) * beta_t
+            seq_state.add_(delta_v[:, :, None] * k_t[:, None, :])
+            out[batch_idx, token_idx] = torch.sum(
+                seq_state * (q_t * scale)[:, None, :], dim=-1
+            ).to(v.dtype)
+
+        state[seq_idx] = seq_state
+
+    if core_attn_out is not None:
+        core_attn_out[: out.numel() // (HV * V)].copy_(out.reshape(-1, HV, V))
+
+    return out, state.to(final_state_dtype) if output_final_state else None
 
 
 # TODO(arpera): remove ``_is_libs_cu13_install_intact`` and its caller in
@@ -357,6 +431,19 @@ class ChunkGatedDeltaRule(CustomOp):
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
     ):
+        if q.device.type != "cuda":
+            return _torch_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                core_attn_out=core_attn_out,
+            )
         return fla_chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -529,9 +616,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         output_gate_type = getattr(config, "output_gate_type", "silu")
         if output_gate_type == "swish":
             output_gate_type = "silu"
-        assert output_gate_type in ["silu", "swish", "sigmoid"], (
-            f"unsupported {output_gate_type=}"
-        )
+        assert output_gate_type in [
+            "silu",
+            "swish",
+            "sigmoid",
+        ], f"unsupported {output_gate_type=}"
 
         self.norm = RMSNormGated(
             self.head_v_dim,
@@ -681,8 +770,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # [b, sq, ng, (hn + hn + np/ng * hn + np/ng + np/ng)]
         # --> [b, sq, ng, hn], [b, sq, ng, hn], [b, sq, ng, np/ng * hn],
         #  [b, sq, ng, np/ng * hn], [b, sq, ng, np/ng], [b, sq, ng, np/ng]
-        (query, key, value, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=2)
-        (b, a) = torch.split(mixed_ba, split_arg_list_ba, dim=2)
+        query, key, value, z = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=2)
+        b, a = torch.split(mixed_ba, split_arg_list_ba, dim=2)
 
         # [b, sq, ng, np/ng * hn] -> [b, sq, np, hn]
         value = value.reshape(value.size(0), -1, self.head_v_dim)
@@ -751,8 +840,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.num_v_heads // self.num_k_heads,
         ]
 
-        (query, key, value, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=-1)
-        (b, a) = torch.split(mixed_ba, split_arg_list_ba, dim=-1)
+        query, key, value, z = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=-1)
+        b, a = torch.split(mixed_ba, split_arg_list_ba, dim=-1)
 
         mixed_qkv_logical = torch.cat(
             [
@@ -1276,6 +1365,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata_raw = forward_context.attn_metadata
 
         if attn_metadata_raw is None:
+            if current_platform.is_mps():
+                return
             self._warmup_prefill_kernels(mixed_qkv, 0)
             return
 
@@ -1303,8 +1394,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
-        spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
-        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
+        spec_state_indices_tensor = (
+            attn_metadata.spec_state_indices_tensor
+        )  # noqa: E501
+        non_spec_state_indices_tensor = (
+            attn_metadata.non_spec_state_indices_tensor
+        )  # noqa: E501
         self_kv_cache = self.kv_cache
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
@@ -1400,9 +1495,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_decode_tokens = attn_metadata.num_decode_tokens
 
         if attn_metadata.num_prefills > 0:
-            assert mixed_qkv_non_spec is not None, (
-                "mixed_qkv_non_spec must be provided for prefill path"
-            )
+            assert (
+                mixed_qkv_non_spec is not None
+            ), "mixed_qkv_non_spec must be provided for prefill path"
             if spec_sequence_masks is not None:
                 a_non_spec = a.index_select(0, non_spec_token_indx)
                 b_non_spec = b.index_select(0, non_spec_token_indx)
@@ -1550,8 +1645,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     initial_state=ssm_state,
                     inplace_final_state=True,
                     cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
-                        : attn_metadata.num_decodes
-                        + 1  # type: ignore[attr-defined]
+                        : attn_metadata.num_decodes + 1  # type: ignore[attr-defined]
                     ],
                     ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
@@ -1584,7 +1678,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata: GDNAttentionMetadata,
     ):
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
-        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
+        non_spec_state_indices_tensor = (
+            attn_metadata.non_spec_state_indices_tensor
+        )  # noqa: E501
         self_kv_cache = self.kv_cache
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
@@ -1652,7 +1748,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         Core attention computation with a packed non-spec decode fast path.
         """
-        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
+        non_spec_state_indices_tensor = (
+            attn_metadata.non_spec_state_indices_tensor
+        )  # noqa: E501
         self_kv_cache = self.kv_cache
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.

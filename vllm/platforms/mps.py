@@ -82,6 +82,10 @@ class MpsPlatform(Platform):
             raise ValueError(f"MPS platform cannot set non-MPS device {device}.")
 
     @classmethod
+    def current_device(cls) -> torch.device:
+        return torch.device("mps")
+
+    @classmethod
     def manual_seed_all(cls, seed: int) -> None:
         torch.mps.manual_seed(seed)
 
@@ -127,7 +131,7 @@ class MpsPlatform(Platform):
 
     @classmethod
     def verify_quantization(cls, quant: str) -> None:
-        if quant in {"auto_gptq", "gptq", "gptq_marlin"}:
+        if quant in {"auto_gptq", "compressed-tensors", "gptq", "gptq_marlin"}:
             return
         raise ValueError(
             f"{quant} quantization is not supported on MPS. Use an unquantized "
@@ -168,7 +172,7 @@ class MpsPlatform(Platform):
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
-        return False
+        return True
 
     @classmethod
     def import_kernels(cls) -> None:

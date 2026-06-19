@@ -9,6 +9,7 @@
 # ruff: noqa: E501
 
 import torch
+import torch.nn.functional as F
 
 from vllm.triton_utils import tl, triton
 
@@ -428,6 +429,44 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         raise ValueError(
             f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}."
         )
+
+    if dev.type != "cuda":
+        q, k, v = torch.split(mixed_qkv, [H * K, H * K, HV * V], dim=-1)
+        q = q.reshape(B, H, K).float()
+        k = k.reshape(B, H, K).float()
+        v = v.reshape(B, HV, V).float()
+        if use_qk_l2norm_in_kernel:
+            q = F.normalize(q, p=2, dim=-1, eps=1e-6)
+            k = F.normalize(k, p=2, dim=-1, eps=1e-6)
+
+        head_group = max(HV // H, 1)
+        head_indices = (
+            torch.arange(HV, device=dev, dtype=torch.long) // head_group
+        ).clamp(max=H - 1)
+        q = q.index_select(1, head_indices) * scale
+        k = k.index_select(1, head_indices)
+
+        gate_input = a.float() + dt_bias.float()
+        g = -torch.exp(A_log.float()) * F.softplus(gate_input, beta=1.0, threshold=20.0)
+        beta = torch.sigmoid(b.float())
+
+        out.zero_()
+        for seq_idx in range(B):
+            state_idx = int(ssm_state_indices[seq_idx].item())
+            if state_idx <= 0:
+                continue
+
+            seq_state = initial_state[state_idx].float()
+            seq_state.mul_(torch.exp(g[seq_idx]).view(HV, 1, 1))
+            pred_v = torch.sum(seq_state * k[seq_idx, :, None, :], dim=-1)
+            delta_v = (v[seq_idx] - pred_v) * beta[seq_idx].view(HV, 1)
+            seq_state.add_(delta_v[:, :, None] * k[seq_idx, :, None, :])
+            out[seq_idx, 0].copy_(
+                torch.sum(seq_state * q[seq_idx, :, None, :], dim=-1).to(out.dtype)
+            )
+            initial_state[state_idx].copy_(seq_state.to(initial_state.dtype))
+
+        return out, initial_state
 
     BK = triton.next_power_of_2(K)
     if triton.cdiv(K, BK) != 1:

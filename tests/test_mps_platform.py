@@ -36,7 +36,10 @@ def test_mps_platform_plugin_activates_on_darwin_mps(
         assert cpu_platform_plugin() is None
 
 
-@pytest.mark.parametrize("quantization", ["auto_gptq", "gptq", "gptq_marlin"])
+@pytest.mark.parametrize(
+    "quantization",
+    ["auto_gptq", "compressed-tensors", "gptq", "gptq_marlin"],
+)
 def test_mps_platform_accepts_gptq_quantization(quantization: str):
     MpsPlatform.verify_quantization(quantization)
 
@@ -44,6 +47,14 @@ def test_mps_platform_accepts_gptq_quantization(quantization: str):
 def test_mps_platform_rejects_cuda_only_quantization():
     with pytest.raises(ValueError, match="not supported on MPS"):
         MpsPlatform.verify_quantization("awq")
+
+
+def test_mps_platform_reports_current_device():
+    assert MpsPlatform.current_device() == torch.device("mps")
+
+
+def test_mps_platform_supports_hybrid_kv_cache():
+    assert MpsPlatform.support_hybrid_kv_cache() is True
 
 
 def test_mps_platform_disables_cuda_only_runtime_features():

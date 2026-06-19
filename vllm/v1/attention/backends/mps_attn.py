@@ -28,6 +28,7 @@ logger = init_logger(__name__)
 
 _MPS_ATTN_PROFILE_TOTALS: dict[str, float] = {}
 _MPS_ATTN_PROFILE_COUNTS: dict[str, int] = {}
+_BATCHED_DECODE_MIN_REQUESTS = 16
 
 
 def _profile_active(device: torch.device) -> bool:
@@ -254,6 +255,28 @@ class MPSAttentionBackendImpl(AttentionImpl):
         if profile:
             started = _profile_mark("reshape_cache", started, query.device)
 
+        if self._can_use_batched_single_token_decode(
+            attn_metadata,
+            query_start_loc,
+            seq_lens,
+        ):
+            self._batched_single_token_decode(
+                query=query,
+                flat_cache=flat_cache,
+                block_size=block_size,
+                attn_metadata=attn_metadata,
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                output=output,
+                profile=profile,
+            )
+            if profile:
+                _profile_log(
+                    f"mps_attn batched_decode reqs={len(seq_lens)} "
+                    f"seq={max(seq_lens) if seq_lens else 0}"
+                )
+            return output
+
         for req_idx, seq_len in enumerate(seq_lens):
             q_start = query_start_loc[req_idx]
             q_end = query_start_loc[req_idx + 1]
@@ -350,6 +373,99 @@ class MPSAttentionBackendImpl(AttentionImpl):
             and q_start >= 0
             and q_end <= key.shape[0]
         )
+
+    def _can_use_batched_single_token_decode(
+        self,
+        attn_metadata: MPSAttentionMetadata,
+        query_start_loc: list[int],
+        seq_lens: list[int],
+    ) -> bool:
+        if not seq_lens:
+            return False
+        if isinstance(attn_metadata.causal, torch.Tensor):
+            return False
+        if self.sliding_window != -1:
+            return False
+        if len(seq_lens) < _BATCHED_DECODE_MIN_REQUESTS:
+            return False
+        if len(set(seq_lens)) != 1:
+            return False
+        for req_idx, seq_len in enumerate(seq_lens):
+            q_len = query_start_loc[req_idx + 1] - query_start_loc[req_idx]
+            if q_len != 1 or seq_len <= 0:
+                return False
+        return True
+
+    def _batched_single_token_decode(
+        self,
+        query: torch.Tensor,
+        flat_cache: torch.Tensor,
+        block_size: int,
+        attn_metadata: MPSAttentionMetadata,
+        query_start_loc: list[int],
+        seq_lens: list[int],
+        output: torch.Tensor,
+        profile: bool,
+    ) -> None:
+        started = _profile_start(query.device) if profile else 0.0
+        groups: dict[int, list[int]] = {}
+        for req_idx, seq_len in enumerate(seq_lens):
+            groups.setdefault(seq_len, []).append(req_idx)
+
+        if profile:
+            started = _profile_mark("batch_group", started, query.device)
+
+        use_gqa = self.num_queries_per_kv != 1
+        for seq_len, req_indices in groups.items():
+            kv_seqs = []
+            q_indices = []
+            for req_idx in req_indices:
+                q_indices.append(query_start_loc[req_idx])
+                slots = self._get_request_slots(
+                    attn_metadata,
+                    attn_metadata.block_table,
+                    req_idx,
+                    seq_len,
+                    block_size,
+                    query.device,
+                )
+                if isinstance(slots, slice):
+                    kv_seqs.append(flat_cache[slots])
+                else:
+                    kv_seqs.append(flat_cache.index_select(0, slots))
+            if profile:
+                started = _profile_mark("batch_fetch_kv", started, query.device)
+
+            kv_batch = torch.stack(kv_seqs, dim=0)
+            key_seq = kv_batch[:, :, :, 0, :]
+            value_seq = kv_batch[:, :, :, 1, :]
+            q = query[q_indices].unsqueeze(2)
+            k = key_seq.transpose(1, 2)
+            v = value_seq.transpose(1, 2)
+            if self.num_queries_per_kv != 1 and not use_gqa:
+                k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
+                v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
+            if profile:
+                started = _profile_mark("batch_prepare_sdpa", started, query.device)
+
+            attn_output = self._scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=False,
+                use_gqa=use_gqa,
+            )
+            if profile:
+                started = _profile_mark("batch_sdpa", started, query.device)
+
+            attn_output = attn_output[:, :, 0, :]
+            if output.dim() == 3:
+                output[q_indices] = attn_output
+            else:
+                output[q_indices] = attn_output.reshape(len(req_indices), -1)
+            if profile:
+                started = _profile_mark("batch_copy_output", started, query.device)
 
     def _write_kv_cache(
         self,

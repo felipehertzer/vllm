@@ -59,9 +59,6 @@ class ModelState(ABC):
     def apply_staged_writes(self) -> None:
         return None
 
-    def remove_request(self, req_id: str) -> None:
-        return None
-
     def postprocess_state(
         self, idx_mapping: torch.Tensor, num_sampled: torch.Tensor
     ) -> None:

@@ -7,7 +7,11 @@
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
+from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
+    causal_conv1d_torch,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
@@ -226,9 +230,13 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 conv_states_ptr
                 + (conv_states_output_coord * stride_conv_state_seq)  # Offset from seq
                 + (idx_feats * stride_conv_state_dim)
-            )[None, :] + (  # [BLOCK_N,]
+            )[
+                None, :
+            ] + (  # [BLOCK_N,]
                 idx_tokens_conv * stride_conv_state_tok
-            )[:, None]
+            )[
+                :, None
+            ]
 
             mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
             tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
@@ -350,7 +358,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 last_full_block_token_index
                 - (n_block_to_fill - chunk_offset) * B_size
                 - state_len
-            ) + tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
+            ) + tl.arange(
+                0, NP2_STATELEN
+            )  # [BLOCK_M]
             x_ptrs = (
                 x_ptr
                 + (idx_tokens_last * stride_x_token)[:, None]
@@ -375,9 +385,13 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 conv_states_ptr
                 + (conv_states_output_coord * stride_conv_state_seq)  # Offset from seq
                 + (idx_feats * stride_conv_state_dim)
-            )[None, :] + (  # [BLOCK_N,]
+            )[
+                None, :
+            ] + (  # [BLOCK_N,]
                 idx_tokens_conv * stride_conv_state_tok
-            )[:, None]
+            )[
+                :, None
+            ]
 
             mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
             tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
@@ -465,6 +479,112 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+def _causal_conv1d_update_torch_fallback(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: str | None,
+    conv_state_indices: torch.Tensor | None,
+    num_accepted_tokens: torch.Tensor | None,
+    query_start_loc: torch.Tensor | None,
+    null_block_id: int | None,
+    block_idx_last_scheduled_token: torch.Tensor | None,
+    initial_state_idx: torch.Tensor | None,
+) -> torch.Tensor:
+    assert activation in {None, "silu", "swish"}
+
+    original_dtype = x.dtype
+    x = x.to(conv_state.dtype)
+    weight = weight.to(conv_state.dtype)
+    if bias is not None:
+        bias = bias.to(conv_state.dtype)
+    _, width = weight.shape
+    state_len = width - 1
+
+    if query_start_loc is None:
+        squeeze = x.dim() == 2
+        x_work = x.unsqueeze(-1) if squeeze else x
+        batch, dim, _ = x_work.shape
+        out = torch.zeros_like(x_work)
+        ranges = [(seq_idx, seq_idx, 0, x_work.shape[-1]) for seq_idx in range(batch)]
+    else:
+        squeeze = False
+        dim = x.size(1)
+        batch = conv_state_indices.size(0)  # type: ignore[union-attr]
+        out = torch.zeros_like(x)
+        starts = query_start_loc.to("cpu")
+        ranges = [
+            (seq_idx, 0, int(starts[seq_idx].item()), int(starts[seq_idx + 1].item()))
+            for seq_idx in range(batch)
+        ]
+
+    weight_1d = weight.unsqueeze(1)
+    for seq_idx, batch_idx, start, end in ranges:
+        if start == end:
+            continue
+
+        state_offset = (
+            int(initial_state_idx[seq_idx].item())
+            if initial_state_idx is not None
+            else 0
+        )
+        write_offset = (
+            int(block_idx_last_scheduled_token[seq_idx].item())
+            if block_idx_last_scheduled_token is not None
+            else 0
+        )
+        if conv_state_indices is None:
+            state_slot = seq_idx
+            write_slot = seq_idx
+        elif conv_state_indices.dim() == 1:
+            state_slot = int(conv_state_indices[seq_idx].item())
+            write_slot = state_slot
+        else:
+            state_slot = int(conv_state_indices[seq_idx, state_offset].item())
+            write_slot = int(conv_state_indices[seq_idx, write_offset].item())
+
+        if state_slot == null_block_id or write_slot == null_block_id:
+            continue
+
+        if query_start_loc is None:
+            seq_x = x_work[batch_idx : batch_idx + 1, :, :]
+        else:
+            seq_x = x[start:end].transpose(0, 1).unsqueeze(0)
+
+        token_offset = (
+            int(num_accepted_tokens[seq_idx].item()) - 1
+            if num_accepted_tokens is not None
+            else 0
+        )
+        initial = conv_state[
+            state_slot, :, token_offset : token_offset + state_len
+        ].unsqueeze(0)
+        conv_input = torch.cat([initial, seq_x], dim=-1)
+
+        seq_out = F.conv1d(
+            conv_input,
+            weight_1d,
+            bias,
+            padding=0,
+            groups=dim,
+        )[..., -seq_x.shape[-1] :]
+        if activation in ("silu", "swish"):
+            seq_out = F.silu(seq_out)
+
+        if query_start_loc is None:
+            out[batch_idx : batch_idx + 1] = seq_out.to(out.dtype)
+        else:
+            out[start:end] = seq_out.squeeze(0).transpose(0, 1).to(out.dtype)
+
+        new_state = conv_input[..., -state_len:].squeeze(0)
+        conv_state[write_slot, :, :state_len].copy_(new_state)
+
+    if squeeze:
+        out = out.squeeze(-1)
+    return out.to(original_dtype)
+
+
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -542,6 +662,20 @@ def causal_conv1d_fn(
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
+    if x.device.type != "cuda":
+        return causal_conv1d_torch(
+            x=x,
+            weight=weight,
+            bias=bias,
+            conv_states=conv_states,
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            activation=activation,
+            pad_slot_id=pad_slot_id,
+            null_block_id=null_block_id,
+        ).to(original_x_dtype)
+
     out = torch.empty_like(x)
     if metadata is not None:
         nums_dict = metadata.nums_dict
@@ -612,16 +746,16 @@ def causal_conv1d_fn(
             assert padded_batch == cache_indices.size(0)
         if has_initial_state is not None:
             assert has_initial_state.size() == (padded_batch,)
-            assert conv_states is not None, (
-                "ERROR: `has_initial_state` is used, which needs also `conv_states`"
-            )
+            assert (
+                conv_states is not None
+            ), "ERROR: `has_initial_state` is used, which needs also `conv_states`"
         assert weight.stride(1) == 1
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
         if block_size_to_align is not None and block_size_to_align > 0:
-            assert (block_size_to_align % BLOCK_M) == 0, (
-                "The mamba block size needs to be divisible by the BLOCK_M"
-            )
+            assert (
+                block_size_to_align % BLOCK_M
+            ) == 0, "The mamba block size needs to be divisible by the BLOCK_M"
         else:
             block_size_to_align = BLOCK_M
 
@@ -660,6 +794,7 @@ def causal_conv1d_fn(
                 META["x_ptr"].device
             )
             return tot
+
     else:
 
         def num_program(META, nums_dict):
@@ -926,9 +1061,13 @@ def _causal_conv1d_update_kernel(
         conv_state_ptr
         + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
         + (idx_feats * stride_conv_state_dim)
-    )[None, :] + (  # [BLOCK_N,]
+    )[
+        None, :
+    ] + (  # [BLOCK_N,]
         idx_tokens * stride_conv_state_tok
-    )[:, None]
+    )[
+        :, None
+    ]
     mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
     tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
@@ -1152,9 +1291,9 @@ def causal_conv1d_update(
         if conv_state_indices is None:
             assert conv_state.size(0) >= batch
         else:
-            assert batch == conv_state_indices.shape[0], (
-                f"ERROR: conv_state_indices should have shape ({batch},*) but got {conv_state_indices.shape}"
-            )
+            assert (
+                batch == conv_state_indices.shape[0]
+            ), f"ERROR: conv_state_indices should have shape ({batch},*) but got {conv_state_indices.shape}"
 
         assert num_cache_lines >= batch
         assert weight.stride(1) == 1  # Need this
@@ -1182,6 +1321,25 @@ def causal_conv1d_update(
         state_len = width - 1 + (seqlen - 1)  # effective state_len needed
     else:
         state_len = width - 1
+
+    if x.device.type != "cuda":
+        out = _causal_conv1d_update_torch_fallback(
+            x=x,
+            conv_state=conv_state,
+            weight=weight,
+            bias=bias,
+            activation=activation,
+            conv_state_indices=conv_state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            query_start_loc=query_start_loc,
+            null_block_id=null_block_id,
+            block_idx_last_scheduled_token=block_idx_last_scheduled_token,
+            initial_state_idx=initial_state_idx,
+        )
+        if unsqueeze:
+            out = out.squeeze(-1)
+        return out.to(original_x_dtype)
+
     np2_statelen = triton.next_power_of_2(state_len)
 
     def grid(META):
