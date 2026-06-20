@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from copy import deepcopy
 from functools import cache
 from typing import Any
@@ -10,6 +11,7 @@ import torch.nn.functional as F
 from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 from transformers import PretrainedConfig
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe  # noqa
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
@@ -73,26 +75,27 @@ logger = init_logger(__name__)
 _MPS_GPTQ_BACKEND_NAME = "MPSDequantLinearKernel"
 _MPS_GPTQ_DIRECT_MIN_OUTPUT_SIZE = 8192
 _MPS_GPTQ_DIRECT_ZERO_WORD = 0x77777777
+_MPS_GPTQ_PROFILE_TOTALS: dict[str, float] = {}
+_MPS_GPTQ_PROFILE_COUNTS: dict[str, int] = {}
 
 
 _MPS_GPTQ_DIRECT_GEMV_SRC = r"""
 #include <metal_stdlib>
 using namespace metal;
 
-#define THREADS 64
+#define SIMD_THREADS 32
 #define VEC8 8
 
-kernel void gptq_gemv_gidx_vec8(device const half* x,
-                                device const int* qweight,
-                                device const half* scales,
-                                device const int* g_idx,
-                                device half* out,
-                                constant uint& N,
-                                constant uint& K,
-                                uint2 tid2 [[thread_position_in_threadgroup]],
-                                uint2 tg [[threadgroup_position_in_grid]]) {
-  threadgroup float partial[THREADS * VEC8];
-  uint tid = tid2.x;
+kernel void gptq_gemv_gidx_vec8_simd32(device const half* x,
+                                       device const int* qweight,
+                                       device const half* scales,
+                                       device const int* g_idx,
+                                       device half* out,
+                                       constant uint& N,
+                                       constant uint& K,
+                                       uint tid [[thread_index_in_threadgroup]],
+                                       uint lane [[thread_index_in_simdgroup]],
+                                       uint2 tg [[threadgroup_position_in_grid]]) {
   uint n0 = tg.y * VEC8;
   float acc[VEC8];
 
@@ -100,7 +103,7 @@ kernel void gptq_gemv_gidx_vec8(device const half* x,
     acc[j] = 0.0f;
   }
 
-  for (uint k = tid; k < K; k += THREADS) {
+  for (uint k = tid; k < K; k += SIMD_THREADS) {
     uint k_pack = k >> 3;
     uint k_shift = (k & 7u) << 2;
     uint group = uint(g_idx[k]);
@@ -110,30 +113,18 @@ kernel void gptq_gemv_gidx_vec8(device const half* x,
       if (n < N) {
         int packed = qweight[k_pack * N + n];
         int w = (packed >> k_shift) & 0xF;
-        acc[j] += xv * ((float(w) - 8.0f) * float(scales[group * N + n]));
+        float wv = (float(w) - 8.0f) * float(scales[group * N + n]);
+        acc[j] = fma(xv, wv, acc[j]);
       }
     }
   }
 
   for (uint j = 0; j < VEC8; ++j) {
-    partial[tid * VEC8 + j] = acc[j];
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  for (uint stride = THREADS >> 1; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      for (uint j = 0; j < VEC8; ++j) {
-        partial[tid * VEC8 + j] += partial[(tid + stride) * VEC8 + j];
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
-
-  if (tid == 0) {
-    for (uint j = 0; j < VEC8; ++j) {
-      uint n = n0 + j;
-      if (n < N) {
-        out[n] = half(partial[j]);
+    uint n = n0 + j;
+    if (n < N) {
+      float total = simd_sum(acc[j]);
+      if (lane == 0) {
+        out[n] = half(total);
       }
     }
   }
@@ -144,6 +135,33 @@ kernel void gptq_gemv_gidx_vec8(device const half* x,
 @cache
 def _get_mps_gptq_direct_gemv_lib():
     return torch.mps.compile_shader(_MPS_GPTQ_DIRECT_GEMV_SRC)
+
+
+def _mps_gptq_profile_active(x: torch.Tensor) -> bool:
+    return x.device.type == "mps" and envs.VLLM_MPS_PROFILE
+
+
+def _mps_gptq_profile_start(x: torch.Tensor) -> float:
+    torch.mps.synchronize()
+    return time.perf_counter()
+
+
+def _mps_gptq_profile_log(name: str, started: float, x: torch.Tensor) -> None:
+    torch.mps.synchronize()
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    _MPS_GPTQ_PROFILE_TOTALS[name] = (
+        _MPS_GPTQ_PROFILE_TOTALS.get(name, 0.0) + elapsed_ms
+    )
+    _MPS_GPTQ_PROFILE_COUNTS[name] = _MPS_GPTQ_PROFILE_COUNTS.get(name, 0) + 1
+    count = _MPS_GPTQ_PROFILE_COUNTS[name]
+    if count % 200 == 0:
+        logger.info(
+            "MPS profile auto_gptq %s: total=%.2fms count=%d avg=%.3fms",
+            name,
+            _MPS_GPTQ_PROFILE_TOTALS[name],
+            count,
+            _MPS_GPTQ_PROFILE_TOTALS[name] / count,
+        )
 
 
 def _unpack_gptq_rows(packed: torch.Tensor, bits: int) -> torch.Tensor:
@@ -617,6 +635,8 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         self.kernel.process_weights_after_loading(layer)
 
     def _can_use_mps_direct_gemv(self, layer: torch.nn.Module) -> bool:
+        if not envs.VLLM_MPS_GPTQ_DIRECT_GEMV:
+            return False
         if self.quant_config.quant_type.size_bits != 4:
             return False
         if self.quant_config.group_size != 128 or not self.quant_config.is_sym:
@@ -646,11 +666,30 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self._use_mps_dequant:
+            profile = _mps_gptq_profile_active(x)
             if self._use_mps_direct_gemv:
+                started = _mps_gptq_profile_start(x) if profile else 0.0
                 direct_output = self._apply_mps_direct_gemv(layer, x, bias)
                 if direct_output is not None:
+                    if profile:
+                        rows = x.reshape(-1, x.shape[-1]).shape[0]
+                        _mps_gptq_profile_log(
+                            f"direct rows={rows} in={x.shape[-1]} "
+                            f"out={layer.qweight.shape[1]}",
+                            started,
+                            x,
+                        )
                     return direct_output
-            return F.linear(x, layer.weight, bias)
+            started = _mps_gptq_profile_start(x) if profile else 0.0
+            output = F.linear(x, layer.weight, bias)
+            if profile:
+                rows = x.reshape(-1, x.shape[-1]).shape[0]
+                _mps_gptq_profile_log(
+                    f"dense rows={rows} in={x.shape[-1]} out={layer.weight.shape[0]}",
+                    started,
+                    x,
+                )
+            return output
         return self.kernel.apply_weights(layer, x, bias)
 
     def _apply_mps_direct_gemv(
@@ -664,14 +703,17 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         input_size = layer.qweight.shape[0] * self.quant_config.pack_factor
         if x.shape[-1] != input_size:
             return None
+        if not x.is_contiguous():
+            return None
         x_2d = x.reshape(-1, input_size)
-        if x_2d.shape[0] != 1 or not x_2d.is_contiguous():
+        rows = x_2d.shape[0]
+        if rows != 1:
             return None
 
         output_size = layer.qweight.shape[1]
-        out = torch.empty((output_size,), device=x.device, dtype=x.dtype)
+        out = torch.empty((rows, output_size), device=x.device, dtype=x.dtype)
         lib = _get_mps_gptq_direct_gemv_lib()
-        lib.gptq_gemv_gidx_vec8(
+        lib.gptq_gemv_gidx_vec8_simd32(
             x_2d,
             layer.qweight,
             layer.scales,
@@ -679,8 +721,8 @@ class AutoGPTQLinearMethod(LinearMethodBase):
             out,
             output_size,
             input_size,
-            threads=(64, (output_size + 7) // 8, 1),
-            group_size=(64, 1, 1),
+            threads=(32, (output_size + 7) // 8, 1),
+            group_size=(32, 1, 1),
         )
         out = out.reshape(*x.shape[:-1], output_size)
         return out if bias is None else out + bias
@@ -726,9 +768,9 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         is_a_8bit = self.input_dtype is not None and self.input_dtype.itemsize == 1
 
         if is_a_8bit:
-            assert self.quant_config.quant_type.size_bits == 8, (
-                "W8A8-INT8 is not supported by marlin kernel."
-            )
+            assert (
+                self.quant_config.quant_type.size_bits == 8
+            ), "W8A8-INT8 is not supported by marlin kernel."
 
         intermediate_size_full = extra_weight_attrs.pop("intermediate_size_full")
 
@@ -876,9 +918,9 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         is_a_8bit = self.input_dtype is not None and self.input_dtype.itemsize == 1
 
         if is_a_8bit:
-            assert self.quant_config.quant_type.size_bits == 8, (
-                "W8A8-INT8 is not supported by marlin kernel."
-            )
+            assert (
+                self.quant_config.quant_type.size_bits == 8
+            ), "W8A8-INT8 is not supported by marlin kernel."
 
         (
             w13,

@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     VLLM_MAX_AUDIO_DECODE_DURATION_S: int = 600
     VLLM_MAX_AUDIO_PREPROCESS_WORKERS: int = max(1, min(os.cpu_count() or 1, 2))
     VLLM_MPS_PROFILE: bool = False
+    VLLM_MPS_GPTQ_DIRECT_GEMV: bool = True
     VLLM_VIDEO_LOADER_BACKEND: str = "opencv"
     VLLM_MEDIA_CONNECTOR: str = "http"
     VLLM_MM_HASHER_ALGORITHM: str = "blake3"
@@ -560,6 +561,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TARGET_DEVICE": lambda: os.getenv("VLLM_TARGET_DEVICE", "cuda").lower(),
     # Enable coarse MPS runner phase timings for local optimization.
     "VLLM_MPS_PROFILE": lambda: bool(int(os.getenv("VLLM_MPS_PROFILE", "0"))),
+    # Enable the MPS AutoGPTQ direct single-row GEMV kernel.
+    "VLLM_MPS_GPTQ_DIRECT_GEMV": lambda: bool(
+        int(os.getenv("VLLM_MPS_GPTQ_DIRECT_GEMV", "1"))
+    ),
     # Main CUDA version of vLLM. This follows PyTorch but can be overridden.
     "VLLM_MAIN_CUDA_VERSION": lambda: (
         os.getenv("VLLM_MAIN_CUDA_VERSION", "").lower() or "13.0"
@@ -1766,10 +1771,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DBO_COMM_SMS": lambda: int(
         os.getenv(
             "VLLM_DBO_COMM_SMS",
-            "64"
-            if hasattr(__import__("torch").version, "hip")
-            and __import__("torch").version.hip is not None
-            else "20",
+            (
+                "64"
+                if hasattr(__import__("torch").version, "hip")
+                and __import__("torch").version.hip is not None
+                else "20"
+            ),
         )
     ),
     # Enable max_autotune & coordinate_descent_tuning in inductor_config
