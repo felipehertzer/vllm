@@ -35,7 +35,7 @@ class MPSModelRunner(GPUModelRunner):
     def _postprocess_triton(self) -> None:
         import vllm.v1.worker.block_table
 
-        vllm.v1.worker.block_table._compute_slot_mapping_kernel = (
+        vllm.v1.worker.block_table._COMPUTE_SLOT_MAPPING_KERNEL.kernel = (
             mps_compute_slot_mapping_kernel
         )
 
@@ -204,6 +204,8 @@ def _compute_slot_mapping_kernel_impl(
     block_table_stride: int,
     block_size: int,
     slot_mapping: torch.Tensor,
+    KV_CACHE_BLOCK_SIZE: int,
+    BLOCKS_PER_KV_BLOCK: int,
     TOTAL_CP_WORLD_SIZE: int,
     TOTAL_CP_RANK: int,
     CP_KV_CACHE_INTERLEAVE_SIZE: int,
@@ -225,11 +227,10 @@ def _compute_slot_mapping_kernel_impl(
         torch.arange(lengths.shape[0], device=device, dtype=torch.long), lengths
     )[:num_tokens]
 
-    virtual_block_size = block_size * TOTAL_CP_WORLD_SIZE
-    block_indices = token_positions // virtual_block_size
-    block_numbers = block_table[req_indices, block_indices].to(dtype=torch.long)
+    virtual_block_size = KV_CACHE_BLOCK_SIZE * TOTAL_CP_WORLD_SIZE
+    virtual_block_indices = token_positions // virtual_block_size
 
-    virtual_block_offsets = token_positions - block_indices * virtual_block_size
+    virtual_block_offsets = token_positions - virtual_block_indices * virtual_block_size
     is_local = (
         virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
     ) % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK
@@ -239,7 +240,12 @@ def _compute_slot_mapping_kernel_impl(
         virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
     )
 
-    slot_ids = block_numbers * block_size + local_block_offsets
+    block_indices = (
+        virtual_block_indices * BLOCKS_PER_KV_BLOCK + local_block_offsets // block_size
+    )
+    block_numbers = block_table[req_indices, block_indices].to(dtype=torch.long)
+    slot_offsets = local_block_offsets % block_size
+    slot_ids = block_numbers * block_size + slot_offsets
     pad_ids = torch.full_like(slot_ids, PAD_ID)
     slot_mapping[:num_tokens].copy_(torch.where(is_local, slot_ids, pad_ids))
 

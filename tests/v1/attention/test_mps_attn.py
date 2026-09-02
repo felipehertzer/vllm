@@ -227,6 +227,8 @@ def test_mps_slot_mapping_matches_block_table_layout():
         block_table_stride=block_table.stride(0),
         block_size=4,
         slot_mapping=slot_mapping,
+        KV_CACHE_BLOCK_SIZE=8,
+        BLOCKS_PER_KV_BLOCK=2,
         TOTAL_CP_WORLD_SIZE=1,
         TOTAL_CP_RANK=0,
         CP_KV_CACHE_INTERLEAVE_SIZE=1,
