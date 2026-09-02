@@ -9,6 +9,7 @@ import torch
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode
 from vllm.config.compilation import CompilationMode
+from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.engine.arg_utils import EngineArgs
 from vllm.platforms import cpu_platform_plugin, mps_platform_plugin
 from vllm.platforms.mps import MpsPlatform
@@ -91,6 +92,7 @@ def test_mps_batch_defaults_are_small_enough_for_metal_kv_cache():
         platform.is_tpu.return_value = False
         platform.is_cpu.return_value = False
         platform.is_mps.return_value = True
+        platform.is_rocm.return_value = False
 
         default_tokens, default_seqs = EngineArgs.get_batch_defaults(world_size=1)
 
@@ -98,3 +100,19 @@ def test_mps_batch_defaults_are_small_enough_for_metal_kv_cache():
     assert default_tokens[UsageContext.OPENAI_API_SERVER] == 2048
     assert default_seqs[UsageContext.LLM_CLASS] == 4
     assert default_seqs[UsageContext.OPENAI_API_SERVER] == 4
+
+
+def test_mps_cleanup_skips_unsupported_host_cache_flush():
+    with (
+        patch("vllm.platforms.current_platform") as platform,
+        patch.object(torch.accelerator, "empty_cache") as empty_cache,
+        patch.object(torch.accelerator, "empty_host_cache") as empty_host_cache,
+    ):
+        platform.is_cpu.return_value = False
+        platform.is_mps.return_value = True
+        platform.is_rocm.return_value = False
+
+        cleanup_dist_env_and_memory()
+
+    empty_cache.assert_called_once_with()
+    empty_host_cache.assert_not_called()

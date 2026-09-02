@@ -5,9 +5,17 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm.model_executor.layers.fla.ops import (
+from vllm.platforms import current_platform
+from vllm.third_party.flash_linear_attention.ops import (
     fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
+)
+
+DEVICE = current_platform.device_type
+
+pytestmark = pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="Gated delta rule Triton kernels require a CUDA-alike or XPU device.",
 )
 
 
@@ -86,7 +94,7 @@ def test_fused_recurrent_packed_decode_matches_reference(
     V = 128
     qkv_dim = 2 * (H * K) + (HV * V)
 
-    device = torch.device("cuda")
+    device = torch.device(DEVICE)
 
     if strided_mixed_qkv:
         # Simulate a packed view into a larger projection buffer:
@@ -101,11 +109,12 @@ def test_fused_recurrent_packed_decode_matches_reference(
     A_log = torch.randn((HV,), device=device, dtype=dtype)
     dt_bias = torch.randn((HV,), device=device, dtype=dtype)
 
-    # Continuous batching indices (include PAD_SLOT_ID=-1 cases).
-    ssm_state_indices = torch.arange(B, device=device, dtype=torch.int32)
+    # Continuous batching indices (include PAD_SLOT_ID=-1 cases). Index 0 is
+    # reserved as NULL_BLOCK_ID (CUDA graph padding), so valid slots start at 1.
+    ssm_state_indices = torch.arange(1, B + 1, device=device, dtype=torch.int32)
     ssm_state_indices[-3:] = -1
 
-    state0 = torch.randn((B, HV, V, K), device=device, dtype=dtype)
+    state0 = torch.randn((B + 1, HV, V, K), device=device, dtype=dtype)
     state_ref = state0.clone()
     state_packed = state0.clone()
 
@@ -122,7 +131,7 @@ def test_fused_recurrent_packed_decode_matches_reference(
         x <= 20.0, torch.log1p(torch.exp(torch.clamp(x, max=20.0))), x
     )
     g = (-torch.exp(A_log.float()) * softplus_x).unsqueeze(1)
-    beta = torch.sigmoid(b.float()).to(dtype).unsqueeze(1)
+    beta = torch.sigmoid(b.float()).unsqueeze(1)
 
     out_ref, state_ref = fused_recurrent_gated_delta_rule(
         q=q,
@@ -154,5 +163,61 @@ def test_fused_recurrent_packed_decode_matches_reference(
 
     atol = 2e-2 if dtype != torch.float32 else 1e-4
     rtol = 1e-2 if dtype != torch.float32 else 1e-4
-    torch.testing.assert_close(out_packed, out_ref, rtol=rtol, atol=atol)
+    # Output rows for PAD_SLOT_ID entries are never written (uninitialized in
+    # both paths), so compare only the valid rows.
+    valid = ssm_state_indices > 0
+    torch.testing.assert_close(out_packed[valid], out_ref[valid], rtol=rtol, atol=atol)
     torch.testing.assert_close(state_packed, state_ref, rtol=rtol, atol=atol)
+
+
+def test_packed_decode_keeps_beta_in_fp32():
+    device = torch.device(DEVICE)
+    dtype = torch.bfloat16
+
+    mixed_qkv = torch.ones((1, 3), device=device, dtype=dtype)
+    a = torch.zeros((1, 1), device=device, dtype=dtype)
+    b = torch.full((1, 1), 0.5, device=device, dtype=dtype)
+    params = torch.zeros((1,), device=device, dtype=dtype)
+    ssm_state_indices = torch.ones((1,), device=device, dtype=torch.int32)
+
+    state_packed = torch.zeros((2, 1, 1, 1), device=device, dtype=torch.float32)
+    out_packed = torch.empty((1, 1, 1, 1), device=device, dtype=dtype)
+
+    fused_recurrent_gated_delta_rule_packed_decode(
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        A_log=params,
+        dt_bias=params,
+        scale=1.0,
+        initial_state=state_packed,
+        out=out_packed,
+        ssm_state_indices=ssm_state_indices,
+    )
+
+    expected_beta = torch.sigmoid(b.float()).squeeze()
+    torch.testing.assert_close(
+        state_packed[1, 0, 0, 0], expected_beta, rtol=1e-6, atol=1e-6
+    )
+
+
+def test_packed_decode_supports_large_batch_head_grid():
+    B, H, HV, K, V = 1024, 8, 64, 1, 1
+    device = torch.device(DEVICE)
+    gates = torch.empty((B, HV), device=device)
+    params = torch.empty((HV,), device=device)
+    out = torch.empty((B, 1, HV, V), device=device)
+
+    fused_recurrent_gated_delta_rule_packed_decode(
+        mixed_qkv=torch.empty((B, 2 * H * K + HV * V), device=device),
+        a=gates,
+        b=gates,
+        A_log=params,
+        dt_bias=params,
+        scale=1.0,
+        initial_state=torch.empty((1, HV, V, K), device=device),
+        out=out,
+        ssm_state_indices=torch.zeros((B,), device=device, dtype=torch.int32),
+    )
+
+    assert torch.count_nonzero(out).item() == 0

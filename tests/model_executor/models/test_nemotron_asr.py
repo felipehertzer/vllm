@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
 from transformers import ParakeetEncoderConfig
+from transformers.feature_extraction_utils import BatchFeature
 
 from vllm.model_executor.models.config import (
     MODELS_CONFIG_MAP,
@@ -20,6 +23,7 @@ from vllm.model_executor.models.nemotron_asr import (
     NemotronASREncoder,
     NemotronASRForRNNT,
     NemotronASRModel,
+    NemotronASRMultiModalProcessor,
 )
 from vllm.model_executor.models.transducer_asr import (
     TransducerDecodeConfig,
@@ -44,6 +48,29 @@ class _FakeDecoder:
             torch.zeros(1, batch, 4),
         )
         return pred_state, next_state
+
+
+def test_nemotron_processor_bypasses_transformers_audio_api():
+    processor = object.__new__(NemotronASRMultiModalProcessor)
+    audio = np.zeros(160, dtype=np.float32)
+    processor._get_hf_mm_data = Mock(  # type: ignore[method-assign]
+        return_value=({"audios": [audio]}, {"passthrough": [torch.tensor(1)]})
+    )
+    processor._extract_audio_features = Mock(  # type: ignore[method-assign]
+        return_value=BatchFeature(
+            data={
+                "input_features": torch.zeros(1, 2, 3),
+                "attention_mask": torch.ones(1, 2),
+            },
+            tensor_type="pt",
+        )
+    )
+
+    result = processor._apply_hf_processor_main(SimpleNamespace(), {})
+
+    processor._extract_audio_features.assert_called_once()
+    assert result["input_ids"] == [[0]]
+    assert result["passthrough"][0].item() == 1
 
 
 def test_nemotron_config_resolves_default_and_alias_language():

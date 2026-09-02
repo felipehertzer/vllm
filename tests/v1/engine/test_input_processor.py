@@ -9,6 +9,7 @@ from vllm.v1.engine.input_processor import InputProcessor
 
 
 class _DummyRenderer:
+    _executor = None
     tokenizer = None
 
     @staticmethod
@@ -48,9 +49,7 @@ def test_input_processor_applies_override_generation_config_eos():
         mm_registry=_DummyMultiModalRegistry(),
     )
     input_processor._validate_params = lambda params, supported_tasks: None
-    input_processor._validate_model_inputs = (
-        lambda encoder_inputs, decoder_inputs: None
-    )
+    input_processor._validate_model_inputs = lambda encoder_inputs, decoder_inputs: None
 
     request = input_processor.process_inputs(
         "request-id",

@@ -14,7 +14,7 @@ from vllm.tokenizers.hf import (
 )
 
 
-@pytest.mark.parametrize("model_id", ["gpt2", "zai-org/chatglm3-6b"])
+@pytest.mark.parametrize("model_id", ["openai-community/gpt2", "zai-org/chatglm3-6b"])
 def test_cached_tokenizer(model_id: str):
     reference_tokenizer = AutoTokenizer.from_pretrained(
         model_id, trust_remote_code=True
@@ -61,7 +61,7 @@ def test_cached_tokenizer_supports_qwen2_without_extended_special_tokens():
     _check_consistency(cached_tokenizer, reference_tokenizer)
 
 
-@pytest.mark.parametrize("model_id", ["gpt2"])
+@pytest.mark.parametrize("model_id", ["openai-community/gpt2"])
 def test_thread_pool_tokenizer_pickle(model_id: str):
     """Regression test for issue #45433: the thread-pool tokenizer wrapper
     reconstructs through maybe_make_thread_pool on unpickling, which used to

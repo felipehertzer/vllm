@@ -209,15 +209,18 @@ class NemotronASRMultiModalProcessor(
             tensor_type="pt",
         )
 
-    def _call_hf_processor(
+    def _apply_hf_processor_main(
         self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
     ) -> BatchFeature:
+        del hf_processor_mm_kwargs
+        mm_data, passthrough_data = self._get_hf_mm_data(mm_items)
         if not mm_data:
-            return BatchFeature(data={"input_ids": [[0]]}, tensor_type="pt")
+            return BatchFeature(
+                data={"input_ids": [[0]], **passthrough_data},
+                tensor_type="pt",
+            )
 
         raw_audios = mm_data.get("audios")
         if isinstance(raw_audios, np.ndarray):
@@ -229,6 +232,7 @@ class NemotronASRMultiModalProcessor(
 
         inputs = self._extract_audio_features(audios)
         inputs["input_ids"] = [[0]]
+        inputs.update(passthrough_data)
         return inputs
 
     def _get_mm_fields_config(

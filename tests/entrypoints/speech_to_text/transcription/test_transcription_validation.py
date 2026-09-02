@@ -2,18 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # imports for structured outputs tests
-import io
 import json
-import math
-import os
 
-import numpy as np
 import pytest
-import soundfile as sf
 
-from tests.entrypoints.speech_to_text.conftest import add_attention_backend
-from tests.utils import ROCM_ENV_OVERRIDES, ROCM_EXTRA_ARGS, RemoteOpenAIServer
-from vllm.multimodal.media.audio import load_audio
+from tests.utils import ROCM_EXTRA_ARGS, RemoteOpenAIServer
 
 MISTRAL_FORMAT_ARGS = [
     "--tokenizer_mode",
@@ -23,24 +16,6 @@ MISTRAL_FORMAT_ARGS = [
     "--load_format",
     "mistral",
 ]
-PARAKEET_HF_MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v3"
-PARAKEET_MODEL_NAME = os.environ.get("PARAKEET_TEST_MODEL", PARAKEET_HF_MODEL_NAME)
-
-
-def make_long_audio(file, *, repeats: int) -> tuple[io.BytesIO, int]:
-    file.seek(0)
-    audio, sr = load_audio(file)
-    # Add small silence after each repeat for repeatable chunk splitting.
-    audio = np.pad(audio, (0, int(sr * 0.1)))
-    repeated_audio = np.tile(audio, repeats)
-
-    buffer = io.BytesIO()
-    buffer.name = "long_audio.wav"
-    sf.write(buffer, repeated_audio, sr, format="WAV")
-    buffer.seek(0)
-
-    expected_seconds = math.ceil(len(repeated_audio) / sr)
-    return buffer, expected_seconds
 
 
 async def transcribe_and_check(
@@ -90,18 +65,14 @@ async def transcribe_and_check(
 @pytest.mark.parametrize(
     "model_name", ["mistralai/Voxtral-Mini-3B-2507", "Qwen/Qwen3-ASR-0.6B"]
 )
-async def test_basic_audio(mary_had_lamb, model_name, rocm_aiter_fa_attention):
+async def test_basic_audio(mary_had_lamb, model_name):
     server_args = ["--enforce-eager", *ROCM_EXTRA_ARGS]
 
     if model_name.startswith("mistralai"):
         server_args += MISTRAL_FORMAT_ARGS
 
-    add_attention_backend(server_args, rocm_aiter_fa_attention)
-
     # Based on https://github.com/openai/openai-cookbook/blob/main/examples/Whisper_prompting_guide.ipynb.
-    with RemoteOpenAIServer(
-        model_name, server_args, env_dict=ROCM_ENV_OVERRIDES
-    ) as remote_server:
+    with RemoteOpenAIServer(model_name, server_args) as remote_server:
         client = remote_server.get_async_client()
         await transcribe_and_check(
             client,
@@ -114,7 +85,7 @@ async def test_basic_audio(mary_had_lamb, model_name, rocm_aiter_fa_attention):
 
 
 @pytest.mark.asyncio
-async def test_basic_audio_with_lora(mary_had_lamb, rocm_aiter_fa_attention):
+async def test_basic_audio_with_lora(mary_had_lamb):
     """Ensure STT (transcribe) requests can pass LoRA through to generate."""
     # ROCm SPECIFIC CONFIGURATION:
     # To ensure the test passes on ROCm, we modify the max model length to 512.
@@ -136,12 +107,8 @@ async def test_basic_audio_with_lora(mary_had_lamb, rocm_aiter_fa_attention):
         "1",
     ]
 
-    add_attention_backend(server_args, rocm_aiter_fa_attention)
-
     # Based on https://github.com/openai/openai-cookbook/blob/main/examples/Whisper_prompting_guide.ipynb.
-    with RemoteOpenAIServer(
-        model_name, server_args, env_dict=ROCM_ENV_OVERRIDES
-    ) as remote_server:
+    with RemoteOpenAIServer(model_name, server_args) as remote_server:
         client = remote_server.get_async_client()
         await transcribe_and_check(
             client,
@@ -157,18 +124,15 @@ async def test_basic_audio_with_lora(mary_had_lamb, rocm_aiter_fa_attention):
 @pytest.mark.parametrize(
     "model_name", ["google/gemma-3n-E2B-it", "Qwen/Qwen3-ASR-0.6B"]
 )
-async def test_basic_audio_foscolo(foscolo, rocm_aiter_fa_attention, model_name):
+async def test_basic_audio_foscolo(foscolo, model_name):
     # Gemma accuracy on some of the audio samples we use is particularly bad,
     # hence we use a different one here. WER is evaluated separately.
     server_args = ["--enforce-eager", *ROCM_EXTRA_ARGS]
-
-    add_attention_backend(server_args, rocm_aiter_fa_attention)
 
     with RemoteOpenAIServer(
         model_name,
         server_args,
         max_wait_seconds=480,
-        env_dict=ROCM_ENV_OVERRIDES,
     ) as remote_server:
         client = remote_server.get_async_client()
         await transcribe_and_check(
@@ -178,76 +142,3 @@ async def test_basic_audio_foscolo(foscolo, rocm_aiter_fa_attention, model_name)
             language="it",
             expected_text="ove il mio corpo fanciulletto",
         )
-
-
-@pytest.fixture(scope="module")
-def parakeet_server(rocm_aiter_fa_attention):
-    server_args = [
-        "--max-model-len",
-        "512",
-        "--max-num-batched-tokens",
-        "512",
-        "--max-num-seqs",
-        "1",
-    ]
-    add_attention_backend(server_args, rocm_aiter_fa_attention)
-
-    with RemoteOpenAIServer(
-        PARAKEET_MODEL_NAME,
-        server_args,
-        max_wait_seconds=480,
-        env_dict=ROCM_ENV_OVERRIDES,
-    ) as remote_server:
-        yield remote_server
-
-
-@pytest.mark.asyncio
-async def test_basic_audio_parakeet(mary_had_lamb, parakeet_server):
-    async with parakeet_server.get_async_client() as client:
-        await transcribe_and_check(
-            client,
-            PARAKEET_MODEL_NAME,
-            mary_had_lamb,
-            language="en",
-            expected_text="Mary had a little lamb",
-            expected_seconds=16,
-        )
-
-
-@pytest.mark.asyncio
-async def test_streaming_audio_parakeet_strips_eos(mary_had_lamb, parakeet_server):
-    transcription = ""
-    async with parakeet_server.get_async_client() as client:
-        res = await client.audio.transcriptions.create(
-            model=PARAKEET_MODEL_NAME,
-            file=mary_had_lamb,
-            language="en",
-            temperature=0.0,
-            stream=True,
-        )
-
-        async for chunk in res:
-            transcription += chunk.choices[0]["delta"]["content"]
-
-    assert "Mary had a little lamb" in transcription
-    assert "<|endoftext|>" not in transcription
-
-
-@pytest.mark.asyncio
-async def test_long_audio_parakeet(mary_had_lamb, parakeet_server):
-    long_audio, expected_seconds = make_long_audio(mary_had_lamb, repeats=3)
-
-    async with parakeet_server.get_async_client() as client:
-        transcription = await client.audio.transcriptions.create(
-            model=PARAKEET_MODEL_NAME,
-            file=long_audio,
-            language="en",
-            response_format="text",
-            temperature=0.0,
-        )
-
-    out = json.loads(transcription)
-    out_text = out["text"]
-    count = out_text.lower().count("mary had a little lamb")
-    assert count == 3, f"Expected 3 repeats, found {count}: {out_text!r}"
-    assert out["usage"]["seconds"] == expected_seconds

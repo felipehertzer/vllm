@@ -9,10 +9,17 @@ import numpy.typing as npt
 import pybase64
 import torch
 
+import vllm.envs as envs
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.multimodal.audio import resample_audio_pyav
 from vllm.utils.import_utils import PlaceholderModule
+from vllm.utils.mem_constants import MiB_bytes
 from vllm.utils.serial_utils import tensor2base64
+from vllm.utils.sparse_utils import (
+    check_sparse_tensor_invariants_threadsafe,
+    safe_to_dense,
+)
 
 from .base import MediaIO
 
@@ -87,6 +94,7 @@ def load_audio_pyav(
     sr: float | None = 22050,
     mono: bool = True,
     max_duration_s: float | None = None,
+    max_decode_bytes: int | None = None,
 ) -> tuple[npt.NDArray, float]:
     """Load an audio file using PyAV (FFmpeg), returning float32 mono waveform.
 
@@ -140,6 +148,7 @@ def load_audio_pyav(
                 int(sr * max_duration_s) if max_duration_s is not None else None
             )
             total_samples = 0
+            total_decode_bytes = 0
 
             chunks: list[npt.NDArray] = []
             needs_resampling = not math.isclose(
@@ -159,10 +168,12 @@ def load_audio_pyav(
                     for out_frame in resampler.resample(frame):
                         arr = out_frame.to_ndarray()
                         total_samples += arr.shape[-1]
+                        total_decode_bytes += arr.nbytes
                         chunks.append(arr)
                 else:
                     arr = frame.to_ndarray()
                     total_samples += arr.shape[-1]
+                    total_decode_bytes += arr.nbytes
                     chunks.append(arr)
 
                 if max_samples is not None and total_samples > max_samples:
@@ -172,6 +183,18 @@ def load_audio_pyav(
                         f"samples at {sr}Hz). Set "
                         f"VLLM_MAX_AUDIO_DECODE_DURATION_S to "
                         f"increase this limit."
+                    )
+                if (
+                    max_decode_bytes is not None
+                    and total_decode_bytes > max_decode_bytes
+                ):
+                    raise ValueError(
+                        f"Audio decode exceeded "
+                        f"{max_decode_bytes / MiB_bytes:.0f} MiB memory "
+                        f"limit ({total_decode_bytes / MiB_bytes:.0f} MiB "
+                        f"decoded so far). Set "
+                        f"VLLM_MAX_AUDIO_DECODE_BYTES to increase this "
+                        f"limit."
                     )
     except (ValueError, ImportError):
         raise
@@ -197,6 +220,7 @@ def load_audio_soundfile(
     sr: float | None = 22050,
     mono: bool = True,
     max_duration_s: float | None = None,
+    max_decode_bytes: int | None = None,
 ) -> tuple[np.ndarray, int]:
     """Load audio via soundfile"""
     with soundfile.SoundFile(path) as f:
@@ -210,6 +234,16 @@ def load_audio_soundfile(
                     f"{file_duration_s:.1f}s at {native_sr}Hz). Set "
                     f"VLLM_MAX_AUDIO_DECODE_DURATION_S to "
                     f"increase this limit."
+                )
+        if max_decode_bytes is not None:
+            estimated_bytes = f.frames * f.channels * np.dtype(np.float32).itemsize
+            if estimated_bytes > max_decode_bytes:
+                raise ValueError(
+                    f"Audio would allocate {estimated_bytes / MiB_bytes:.0f} "
+                    f"MiB of PCM ({f.frames} frames x {f.channels} channels"
+                    f" x 4B), exceeding the "
+                    f"{max_decode_bytes / MiB_bytes:.0f} MiB limit. Set "
+                    f"VLLM_MAX_AUDIO_DECODE_BYTES to increase this limit."
                 )
         y = f.read(dtype="float32", always_2d=False).T
 
@@ -230,6 +264,7 @@ def load_audio(
     filename: str | None = None,
     content_type: str | None = None,
     max_duration_s: float | None = None,
+    max_decode_bytes: int | None = None,
 ):
     if _should_try_pyav_first(path, filename=filename, content_type=content_type):
         try:
@@ -243,7 +278,11 @@ def load_audio(
 
     try:
         return load_audio_soundfile(
-            path, sr=sr, mono=mono, max_duration_s=max_duration_s
+            path,
+            sr=sr,
+            mono=mono,
+            max_duration_s=max_duration_s,
+            max_decode_bytes=max_decode_bytes,
         )
     except ImportError as exc:
         # soundfile (or resampy) is not installed — fall through to pyav.
@@ -261,7 +300,13 @@ def load_audio(
     if isinstance(path, BytesIO):
         path.seek(0)
     try:
-        return load_audio_pyav(path, sr=sr, mono=mono, max_duration_s=max_duration_s)
+        return load_audio_pyav(
+            path,
+            sr=sr,
+            mono=mono,
+            max_duration_s=max_duration_s,
+            max_decode_bytes=max_decode_bytes,
+        )
     except ImportError:
         raise  # Let PlaceholderModule's message ("install vllm[audio]") propagate.
     except Exception as pyav_exc:
@@ -285,18 +330,49 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
         # for flexible control.
         self.kwargs = kwargs
 
+    def get_max_bytes(self) -> int:
+        return int(envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB * MiB_bytes)
+
+    def _validate_encoded_size(self, size: int) -> None:
+        max_bytes = self.get_max_bytes()
+        if size > max_bytes:
+            raise VLLMValidationError(
+                "Maximum file size exceeded",
+                parameter="audio_filesize_mb",
+                value=size / MiB_bytes,
+            )
+
     def load_bytes(self, data: bytes) -> tuple[npt.NDArray, float]:
-        return load_audio(BytesIO(data), sr=None)
+        self._validate_encoded_size(len(data))
+        return load_audio(
+            BytesIO(data),
+            sr=None,
+            max_duration_s=envs.VLLM_MAX_AUDIO_DECODE_DURATION_S,
+            max_decode_bytes=envs.VLLM_MAX_AUDIO_DECODE_BYTES,
+        )
 
     def load_base64(
         self,
         media_type: str,
         data: str,
     ) -> tuple[npt.NDArray, float]:
-        return self.load_bytes(pybase64.b64decode(data))
+        max_encoded_chars = 4 * ((self.get_max_bytes() + 2) // 3)
+        if len(data) > max_encoded_chars:
+            raise VLLMValidationError(
+                "Maximum file size exceeded",
+                parameter="audio_filesize_mb",
+                value=(len(data) * 3 / 4) / MiB_bytes,
+            )
+        return self.load_bytes(pybase64.b64decode(data, validate=True))
 
     def load_file(self, filepath: Path) -> tuple[npt.NDArray, float]:
-        return load_audio(filepath, sr=None)
+        self._validate_encoded_size(filepath.stat().st_size)
+        return load_audio(
+            filepath,
+            sr=None,
+            max_duration_s=envs.VLLM_MAX_AUDIO_DECODE_DURATION_S,
+            max_decode_bytes=envs.VLLM_MAX_AUDIO_DECODE_BYTES,
+        )
 
     def encode_base64(
         self,
@@ -324,21 +400,17 @@ class AudioEmbeddingMediaIO(MediaIO[torch.Tensor]):
 
     def load_bytes(self, data: bytes) -> torch.Tensor:
         buffer = BytesIO(data)
-        # Enable sparse tensor integrity checks to prevent out-of-bounds
-        # writes from maliciously crafted tensors
-        with torch.sparse.check_sparse_tensor_invariants():
+        with check_sparse_tensor_invariants_threadsafe():
             tensor = torch.load(buffer, weights_only=True)
-            return tensor.to_dense()
+            return safe_to_dense(tensor, parameter="audio_embeds")
 
     def load_base64(self, media_type: str, data: str) -> torch.Tensor:
         return self.load_bytes(pybase64.b64decode(data, validate=True))
 
     def load_file(self, filepath: Path) -> torch.Tensor:
-        # Enable sparse tensor integrity checks to prevent out-of-bounds
-        # writes from maliciously crafted tensors
-        with torch.sparse.check_sparse_tensor_invariants():
+        with check_sparse_tensor_invariants_threadsafe():
             tensor = torch.load(filepath, weights_only=True)
-            return tensor.to_dense()
+            return safe_to_dense(tensor, parameter="audio_embeds")
 
     def encode_base64(self, media: torch.Tensor) -> str:
         return tensor2base64(media)

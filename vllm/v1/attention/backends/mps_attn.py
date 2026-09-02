@@ -320,9 +320,12 @@ class MPSAttentionBackendImpl(AttentionImpl):
             v = value_seq.transpose(0, 1).unsqueeze(0)
             attn_mask = None
             is_causal = self._can_use_sdpa_causal(q_len, seq_len, attn_metadata.causal)
-            if not self._can_skip_mask_for_single_token_decode(
-                q_len, attn_metadata.causal
-            ) and not is_causal:
+            if (
+                not self._can_skip_mask_for_single_token_decode(
+                    q_len, attn_metadata.causal
+                )
+                and not is_causal
+            ):
                 attn_mask = self._build_mask(
                     q_len=q_len,
                     seq_len=seq_len,
@@ -543,10 +546,7 @@ class MPSAttentionBackendImpl(AttentionImpl):
                 cache[cache_key] = None
                 return None
             blocks = block_table_cpu[req_idx, :num_blocks]
-            if (
-                blocks.numel() > 1
-                and not bool(torch.all(blocks.diff() == 1).item())
-            ):
+            if blocks.numel() > 1 and not bool(torch.all(blocks.diff() == 1).item()):
                 cache[cache_key] = None
                 return None
 
@@ -579,9 +579,7 @@ class MPSAttentionBackendImpl(AttentionImpl):
 
         num_blocks = (seq_len + block_size - 1) // block_size
         block_table_cpu = cast(torch.Tensor, attn_metadata.block_table_cpu)
-        blocks_cpu = block_table_cpu[req_idx, :num_blocks].to(
-            dtype=torch.long
-        )
+        blocks_cpu = block_table_cpu[req_idx, :num_blocks].to(dtype=torch.long)
         if blocks_cpu.numel() > 0 and bool(torch.all(blocks_cpu.diff() == 1).item()):
             start = int(blocks_cpu[0].item()) * block_size
             slots = slice(start, start + seq_len)

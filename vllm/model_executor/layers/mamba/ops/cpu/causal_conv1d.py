@@ -6,20 +6,32 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from vllm._custom_ops import causal_conv1d_update_cpu_vec
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
-# for prefill
-def causal_conv1d_torch(
+
+def causal_conv1d_fn_cpu(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     conv_states: torch.Tensor,
     query_start_loc: torch.Tensor,
-    cache_indices: torch.Tensor | None,
-    has_initial_state: torch.Tensor | None,
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
     activation: str | None = "silu",
-    pad_slot_id: int | None = None,
+    pad_slot_id: int = PAD_SLOT_ID,
     null_block_id: int | None = None,
+    **kwargs,
 ) -> torch.Tensor:
+    """CPU implementation for causal_conv1d_fwd."""
+    if isinstance(activation, bool) and activation:
+        activation = "silu"
+    elif isinstance(activation, bool):
+        activation = None
+
+    original_x_dtype = x.dtype
+    x = x.to(conv_states.dtype)
+
     out = torch.empty_like(x)
     state_len = weight.shape[1] - 1
     assert activation in {None, "silu", "swish"}
@@ -29,7 +41,11 @@ def causal_conv1d_torch(
         for idx in range(query_start_loc.shape[0] - 1)
     ]
     weight = weight.unsqueeze(1)
+
     for seq_idx, (bos, eos) in enumerate(seq_begin_end_idx):
+        if bos == eos:
+            continue
+
         if cache_indices is None:
             slot = seq_idx
         elif cache_indices.dim() == 1:
@@ -37,7 +53,7 @@ def causal_conv1d_torch(
         else:
             slot = int(cache_indices[seq_idx, 0].item())
 
-        if slot in {pad_slot_id, null_block_id}:
+        if slot == pad_slot_id or (null_block_id is not None and slot == null_block_id):
             out[:, bos:eos].zero_()
             continue
 
@@ -65,16 +81,48 @@ def causal_conv1d_torch(
             groups=weight.shape[0],
         )
         seq_out = seq_out[..., -seq_x.shape[-1] :].to(dtype=x.dtype)
+
         if activation in ("silu", "swish"):
             seq_out = F.silu(seq_out)
 
         out[:, bos:eos] = seq_out.squeeze(0)
         conv_states[slot, :, :state_len].copy_(conv_input[..., -state_len:].squeeze(0))
 
-    return out
+    return out.to(original_x_dtype)
 
 
-# for decode
+def causal_conv1d_update_cpu(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    activation: bool | str | None = None,
+    conv_state_indices: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    pad_slot_id: int | None = None,
+    **kwargs,
+) -> torch.Tensor:
+    """CPU implementation for causal_conv1d_update."""
+    if isinstance(activation, bool):
+        activation = "silu" if activation else None
+
+    if pad_slot_id is None:
+        pad_slot_id = kwargs.get("null_block_id", NULL_BLOCK_ID)
+        if pad_slot_id is None:
+            pad_slot_id = NULL_BLOCK_ID
+
+    return causal_conv1d_update_cpu_vec(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation,
+        conv_state_indices,
+        query_start_loc,
+        pad_slot_id,
+    )
+
+
 def causal_conv1d_update_torch(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -82,6 +130,11 @@ def causal_conv1d_update_torch(
     bias: torch.Tensor | None = None,
     activation: str | None = None,
 ) -> torch.Tensor:
+    """
+    Pure PyTorch fallback for causal_conv1d_update.
+    Currently used as a fallback for Arm (aarch64) to leverage
+    oneDNN/ACL F.conv1d kernels for batched decoding.
+    """
     assert activation in {None, "silu", "swish"}
 
     _, dim, seq_len = x.shape
