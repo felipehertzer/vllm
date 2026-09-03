@@ -9,10 +9,11 @@ import asyncio
 import io
 import os
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal
+from typing import Literal, Protocol, cast
 
 import numpy as np
 import torch
@@ -22,6 +23,7 @@ from fastapi.responses import JSONResponse
 from safetensors.torch import safe_open
 from transformers import PreTrainedTokenizerFast
 
+from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationConfig, CompilationMode
 from vllm.model_executor.models.nemotron_asr import NemotronASRForRNNT
 from vllm.model_executor.models.parakeet import ParakeetExtractor
@@ -36,11 +38,77 @@ class _MMConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class WordTimestamp:
+    word: str
+    start: float
+    end: float
+
+
+class TimestampTokenizer(Protocol):
+    all_special_ids: list[int]
+
+    def convert_ids_to_tokens(self, token_ids: Sequence[int]) -> list[str]: ...
+
+
+def words_from_token_timesteps(
+    tokenizer: TimestampTokenizer,
+    *,
+    token_ids: Sequence[int],
+    timesteps: Sequence[int],
+    frame_shift_seconds: float,
+    duration_seconds: float,
+) -> tuple[WordTimestamp, ...]:
+    timed_token_ids = list(token_ids[: len(timesteps)])
+    tokens = tokenizer.convert_ids_to_tokens(timed_token_ids)
+    special_ids = set(tokenizer.all_special_ids)
+    words: list[tuple[str, float]] = []
+    current_parts: list[str] = []
+    current_start = 0.0
+
+    for token_id, token, timestep in zip(
+        timed_token_ids,
+        tokens,
+        timesteps,
+        strict=True,
+    ):
+        if token_id in special_ids or token.startswith("<"):
+            continue
+        starts_word = token.startswith("▁")
+        piece = token.removeprefix("▁")
+        if starts_word and current_parts:
+            words.append(("".join(current_parts), current_start))
+            current_parts = []
+        if not current_parts:
+            current_start = min(
+                duration_seconds,
+                max(0.0, float(timestep) * frame_shift_seconds),
+            )
+        current_parts.append(piece)
+    if current_parts:
+        words.append(("".join(current_parts), current_start))
+
+    timestamped: list[WordTimestamp] = []
+    for index, (word, start) in enumerate(words):
+        next_start = words[index + 1][1] if index + 1 < len(words) else duration_seconds
+        end = min(duration_seconds, max(start + frame_shift_seconds, next_start))
+        if word and end > start:
+            timestamped.append(
+                WordTimestamp(
+                    word=word,
+                    start=round(start, 3),
+                    end=round(end, 3),
+                )
+            )
+    return tuple(timestamped)
+
+
+@dataclass(frozen=True, slots=True)
 class Transcription:
     text: str
     duration_s: float
     decode_ms: float
     inference_ms: float
+    words: tuple[WordTimestamp, ...]
 
 
 class NemotronDirectRuntime:
@@ -50,7 +118,7 @@ class NemotronDirectRuntime:
         self,
         model_dir: Path,
         *,
-        device: Literal["cpu", "mps"] = "mps",
+        device: Literal["cpu", "cuda", "mps"] = "mps",
         warmup_seconds: float = 30.0,
         max_audio_seconds: float = 1_800.0,
         max_audio_bytes: int = 100 * 1024 * 1024,
@@ -91,7 +159,7 @@ class NemotronDirectRuntime:
             model_config=model_config,
             compilation_config=CompilationConfig(mode=CompilationMode.NONE),
         )
-        model = NemotronASRForRNNT(vllm_config=vllm_config)
+        model = NemotronASRForRNNT(vllm_config=cast(VllmConfig, vllm_config))
         with safe_open(
             self.model_dir / "model.safetensors",
             framework="pt",
@@ -101,7 +169,7 @@ class NemotronDirectRuntime:
             model.load_weights(
                 (name, checkpoint.get_tensor(name)) for name in tensor_names
             )
-        if self.device.type == "cpu":
+        if self.device.type in {"cpu", "cuda"}:
             model.to(self.device)
         return model.eval()
 
@@ -116,7 +184,7 @@ class NemotronDirectRuntime:
     def _transcribe_waveform(self, waveform: np.ndarray) -> Transcription:
         started_at = time.perf_counter()
         features, attention_mask = self._features(waveform)
-        if self.device.type == "cpu":
+        if self.device.type in {"cpu", "cuda"}:
             features = features.to(self.device)
             attention_mask = attention_mask.to(self.device)
 
@@ -126,17 +194,27 @@ class NemotronDirectRuntime:
                 attention_mask,
             )
             decode_started_at = time.perf_counter()
-            token_ids = self.model.model.greedy_decode_batch(encoder_outputs)[0]
+            hypothesis = self.model.model.greedy_decode_batch_with_timestamps(
+                encoder_outputs
+            )[0]
             decode_ms = (time.perf_counter() - decode_started_at) * 1000
 
         text = self.model.post_process_output(
-            self.tokenizer.decode(token_ids, skip_special_tokens=True)
+            self.tokenizer.decode(hypothesis.token_ids, skip_special_tokens=True)
         )
+        duration_seconds = len(waveform) / float(self.config.sample_rate)
         return Transcription(
             text=text,
-            duration_s=len(waveform) / float(self.config.sample_rate),
+            duration_s=duration_seconds,
             decode_ms=decode_ms,
             inference_ms=(time.perf_counter() - started_at) * 1000,
+            words=words_from_token_timesteps(
+                self.tokenizer,
+                token_ids=hypothesis.token_ids,
+                timesteps=hypothesis.timesteps,
+                frame_shift_seconds=self.config.frame_shift_seconds,
+                duration_seconds=duration_seconds,
+            ),
         )
 
     def transcribe_bytes(
@@ -261,6 +339,10 @@ def create_app(
         return JSONResponse(
             {
                 "text": result.text,
+                "words": [
+                    {"word": word.word, "start": word.start, "end": word.end}
+                    for word in result.words
+                ],
                 "usage": {
                     "type": "duration",
                     "seconds": int(np.ceil(result.duration_s)),
@@ -281,7 +363,7 @@ def main() -> None:
     parser.add_argument("--served-model-name", default="nemotron-asr")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8003)
-    parser.add_argument("--device", choices=("cpu", "mps"), default="mps")
+    parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default="mps")
     parser.add_argument("--warmup-seconds", type=float, default=30.0)
     parser.add_argument("--max-audio-seconds", type=float, default=1_800.0)
     parser.add_argument("--max-upload-mb", type=int, default=100)

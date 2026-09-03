@@ -39,8 +39,10 @@ from vllm.model_executor.models.parakeet import ParakeetExtractor
 from vllm.model_executor.models.transducer_asr import (
     TransducerASRForcedDecoderState,
     TransducerDecodeConfig,
+    TransducerHypothesis,
     TransducerPredictionDecoder,
     greedy_decode_transducer_batch,
+    greedy_decode_transducer_batch_with_timestamps,
     strip_asr_special_tokens,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
@@ -1050,6 +1052,39 @@ class NemotronASRModel(nn.Module):
             max_symbols_per_step=cfg.max_symbols_per_step,
         )
         return greedy_decode_transducer_batch(
+            encoder_projected=encoder_projected,
+            lengths=lengths,
+            decoder=self.decoder,
+            joint_logits=self._joint_logits,
+            config=decode_config,
+        )
+
+    def greedy_decode_batch_with_timestamps(
+        self,
+        encoder_outputs: Sequence[torch.Tensor],
+        prompt_ids: torch.Tensor | None = None,
+    ) -> list[TransducerHypothesis]:
+        if not encoder_outputs:
+            return []
+
+        device = encoder_outputs[0].device
+        cfg = self.config
+        lengths = torch.tensor(
+            [int(encoder_output.shape[0]) for encoder_output in encoder_outputs],
+            dtype=torch.long,
+            device=device,
+        )
+        encoder_projected = self._encoder_with_language_prompt(
+            encoder_outputs,
+            prompt_ids=prompt_ids,
+        )
+        decode_config = TransducerDecodeConfig(
+            vocab_size=cfg.vocab_size,
+            blank_token_id=cfg.blank_token_id,
+            eos_token_id=cfg.eos_token_id,
+            max_symbols_per_step=cfg.max_symbols_per_step,
+        )
+        return greedy_decode_transducer_batch_with_timestamps(
             encoder_projected=encoder_projected,
             lengths=lengths,
             decoder=self.decoder,

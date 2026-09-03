@@ -28,6 +28,7 @@ from vllm.model_executor.models.nemotron_asr import (
 from vllm.model_executor.models.transducer_asr import (
     TransducerDecodeConfig,
     greedy_decode_transducer_batch,
+    greedy_decode_transducer_batch_with_timestamps,
     strip_asr_special_tokens,
 )
 from vllm.sampling_params import SamplingParams
@@ -356,6 +357,33 @@ def test_rnnt_greedy_decode_batch_emits_until_blank():
     )
 
     assert outputs == [[0, 1], [0, 1]]
+
+
+def test_rnnt_greedy_decode_preserves_emission_frames():
+    decoder = _FakeDecoder()
+
+    def joint_logits(encoder_state, pred_state):
+        del pred_state
+        frame = int(encoder_state[0, 0].item())
+        if frame in {0, 2}:
+            return torch.tensor([[9.0, 0.0, 0.0]])
+        return torch.tensor([[0.0, 0.0, 9.0]])
+
+    hypotheses = greedy_decode_transducer_batch_with_timestamps(
+        encoder_projected=torch.tensor([[[0.0] * 4, [1.0] * 4, [2.0] * 4]]),
+        lengths=torch.tensor([3]),
+        decoder=decoder,
+        joint_logits=joint_logits,
+        config=TransducerDecodeConfig(
+            vocab_size=3,
+            blank_token_id=2,
+            eos_token_id=1,
+            max_symbols_per_step=1,
+        ),
+    )
+
+    assert hypotheses[0].token_ids == [0, 0, 1]
+    assert hypotheses[0].timesteps == [0, 2]
 
 
 def test_rnnt_greedy_decode_batch_advances_at_symbol_limit():

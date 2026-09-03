@@ -69,6 +69,12 @@ class TransducerDecodeConfig:
     durations: Sequence[int] = ()
 
 
+@dataclass(frozen=True)
+class TransducerHypothesis:
+    token_ids: list[int]
+    timesteps: list[int]
+
+
 class TransducerPredictionDecoder(nn.Module):
     def __init__(
         self,
@@ -125,6 +131,26 @@ def greedy_decode_transducer_batch(
     joint_logits,
     config: TransducerDecodeConfig,
 ) -> list[list[int]]:
+    return [
+        hypothesis.token_ids
+        for hypothesis in greedy_decode_transducer_batch_with_timestamps(
+            encoder_projected=encoder_projected,
+            lengths=lengths,
+            decoder=decoder,
+            joint_logits=joint_logits,
+            config=config,
+        )
+    ]
+
+
+def greedy_decode_transducer_batch_with_timestamps(
+    *,
+    encoder_projected: torch.Tensor,
+    lengths: torch.Tensor,
+    decoder: TransducerPredictionDecoder,
+    joint_logits,
+    config: TransducerDecodeConfig,
+) -> list[TransducerHypothesis]:
     """Greedy batched RNN-T/TDT decode.
 
     ``encoder_projected`` is ``[batch, time, hidden]``. If ``config.durations``
@@ -144,7 +170,7 @@ def greedy_decode_transducer_batch(
         torch.tensor(durations, dtype=torch.long, device=device) if is_tdt else None
     )
     if not is_tdt:
-        return _greedy_decode_rnnt_batch(
+        return _greedy_decode_rnnt_batch_with_timestamps(
             encoder_projected=encoder_projected,
             lengths=lengths,
             decoder=decoder,
@@ -165,6 +191,11 @@ def greedy_decode_transducer_batch(
     output_ids = torch.full(
         (batch_size, max_output_tokens),
         config.eos_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+    output_timesteps = torch.zeros(
+        (batch_size, max_output_tokens),
         dtype=torch.long,
         device=device,
     )
@@ -222,6 +253,7 @@ def greedy_decode_transducer_batch(
             nonblank_rows = loop_rows[nonblank_tokens]
             emit_positions = output_lengths[nonblank_rows]
             output_ids[nonblank_rows, emit_positions] = tokens[nonblank_tokens]
+            output_timesteps[nonblank_rows, emit_positions] = time_idx[nonblank_rows]
             output_lengths[nonblank_rows] += 1
 
             last_tokens[nonblank_rows] = tokens[nonblank_tokens]
@@ -266,27 +298,31 @@ def greedy_decode_transducer_batch(
     output_lengths = eos_positions + 1
 
     output_ids_cpu = output_ids.cpu()
+    output_timesteps_cpu = output_timesteps.cpu()
     output_lengths_cpu = output_lengths.cpu().tolist()
     return [
-        output_ids_cpu[row, :output_length].tolist()
+        TransducerHypothesis(
+            token_ids=output_ids_cpu[row, :output_length].tolist(),
+            timesteps=output_timesteps_cpu[row, : max(0, output_length - 1)].tolist(),
+        )
         for row, output_length in enumerate(output_lengths_cpu)
     ]
 
 
-def _greedy_decode_rnnt_batch(
+def _greedy_decode_rnnt_batch_with_timestamps(
     *,
     encoder_projected: torch.Tensor,
     lengths: torch.Tensor,
     decoder: TransducerPredictionDecoder,
     joint_logits,
     config: TransducerDecodeConfig,
-) -> list[list[int]]:
+) -> list[TransducerHypothesis]:
     device = encoder_projected.device
     batch_size = int(encoder_projected.shape[0])
     max_encoder_frames = int(encoder_projected.shape[1])
     if device.type == "cpu" and batch_size == 1:
         return [
-            _greedy_decode_rnnt_single_cpu(
+            _greedy_decode_rnnt_single_cpu_with_timestamps(
                 encoder_projected=encoder_projected[0],
                 length=int(lengths[0].item()),
                 decoder=decoder,
@@ -312,6 +348,11 @@ def _greedy_decode_rnnt_batch(
     output_ids = torch.full(
         (batch_size, max_output_tokens),
         config.eos_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+    output_timesteps = torch.zeros(
+        (batch_size, max_output_tokens),
         dtype=torch.long,
         device=device,
     )
@@ -405,6 +446,7 @@ def _greedy_decode_rnnt_batch(
             nonblank_rows = loop_rows[nonblank_tokens]
             emit_positions = output_lengths[nonblank_rows]
             output_ids[nonblank_rows, emit_positions] = tokens[nonblank_tokens]
+            output_timesteps[nonblank_rows, emit_positions] = time_idx[nonblank_rows]
             output_lengths[nonblank_rows] += 1
 
             last_tokens[nonblank_rows] = tokens[nonblank_tokens]
@@ -438,24 +480,29 @@ def _greedy_decode_rnnt_batch(
     output_lengths = eos_positions + 1
 
     output_ids_cpu = output_ids.cpu()
+    output_timesteps_cpu = output_timesteps.cpu()
     output_lengths_cpu = output_lengths.cpu().tolist()
     return [
-        output_ids_cpu[row, :output_length].tolist()
+        TransducerHypothesis(
+            token_ids=output_ids_cpu[row, :output_length].tolist(),
+            timesteps=output_timesteps_cpu[row, : max(0, output_length - 1)].tolist(),
+        )
         for row, output_length in enumerate(output_lengths_cpu)
     ]
 
 
-def _greedy_decode_rnnt_single_cpu(
+def _greedy_decode_rnnt_single_cpu_with_timestamps(
     *,
     encoder_projected: torch.Tensor,
     length: int,
     decoder: TransducerPredictionDecoder,
     joint_logits,
     config: TransducerDecodeConfig,
-) -> list[int]:
+) -> TransducerHypothesis:
     assert encoder_projected.device.type == "cpu"
 
     output_ids: list[int] = []
+    timesteps: list[int] = []
     state: tuple[torch.Tensor, torch.Tensor] | None = None
     cached_pred_state: torch.Tensor | None = None
     cached_next_state: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -486,6 +533,7 @@ def _greedy_decode_rnnt_single_cpu(
                 break
 
             output_ids.append(token)
+            timesteps.append(time_idx)
             label[0] = token
             state = cached_next_state
             cached_prediction_valid = False
@@ -494,7 +542,7 @@ def _greedy_decode_rnnt_single_cpu(
             time_idx += 1
 
     output_ids.append(config.eos_token_id)
-    return output_ids
+    return TransducerHypothesis(token_ids=output_ids, timesteps=timesteps)
 
 
 def strip_asr_special_tokens(text: str) -> str:
