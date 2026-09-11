@@ -12,6 +12,23 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+@torch.compile(fullgraph=True)
+def _lstm_step_from_input_gates(
+    input_gates: torch.Tensor,
+    hidden: torch.Tensor,
+    cell: torch.Tensor,
+    recurrent_weight: torch.Tensor,
+    recurrent_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    gates = input_gates + F.linear(hidden, recurrent_weight, recurrent_bias)
+    input_gate, forget_gate, candidate, output_gate = gates.chunk(4, dim=-1)
+    next_cell = torch.sigmoid(forget_gate) * cell + torch.sigmoid(
+        input_gate
+    ) * torch.tanh(candidate)
+    return torch.sigmoid(output_gate) * torch.tanh(next_cell), next_cell
 
 
 class TransducerASRForcedDecoderState:
@@ -92,6 +109,70 @@ class TransducerPredictionDecoder(nn.Module):
             batch_first=True,
         )
         self.decoder_projector = nn.Linear(hidden_size, hidden_size)
+        self._cpu_input_gate_cache: torch.Tensor | None = None
+        self._cpu_input_gate_key: tuple[tuple[int, int], ...] | None = None
+
+    def _input_gate_table(self) -> torch.Tensor | None:
+        parameters = (
+            self.embedding.weight,
+            self.lstm.weight_ih_l0,
+            self.lstm.bias_ih_l0,
+        )
+        # This path is for resident, frozen CPU decoders with small vocabularies.
+        # Bound the table rather than scaling its memory with arbitrary models.
+        if (
+            self.training
+            or torch.is_grad_enabled()
+            or self.embedding.weight.device.type != "cpu"
+            or self.embedding.weight.dtype != torch.float32
+            or self.embedding.num_embeddings * 4 * self.lstm.hidden_size * 4
+            > 64 * 1024 * 1024
+            or any(parameter.is_inference() for parameter in parameters)
+        ):
+            return None
+        key = tuple(
+            (parameter.data_ptr(), parameter._version) for parameter in parameters
+        )
+        if key != self._cpu_input_gate_key:
+            self._cpu_input_gate_cache = F.linear(*parameters)
+            self._cpu_input_gate_key = key
+        return self._cpu_input_gate_cache
+
+    def _predict_from_input_gates(
+        self,
+        input_gates: torch.Tensor,
+        state: tuple[torch.Tensor, torch.Tensor] | None,
+        rows: torch.Tensor,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if state is None:
+            hidden = input_gates.new_zeros(
+                self.lstm.num_layers, input_gates.shape[0], self.lstm.hidden_size
+            )
+            cell = torch.zeros_like(hidden)
+        else:
+            hidden, cell = state[0][:, rows, :], state[1][:, rows, :]
+        next_hidden, next_cell = [], []
+        output = input_gates
+        for layer in range(self.lstm.num_layers):
+            if layer:
+                output = F.linear(
+                    output,
+                    getattr(self.lstm, f"weight_ih_l{layer}"),
+                    getattr(self.lstm, f"bias_ih_l{layer}"),
+                )
+            output, cell_output = _lstm_step_from_input_gates(
+                output,
+                hidden[layer],
+                cell[layer],
+                getattr(self.lstm, f"weight_hh_l{layer}"),
+                getattr(self.lstm, f"bias_hh_l{layer}"),
+            )
+            next_hidden.append(output)
+            next_cell.append(cell_output)
+        return self.decoder_projector(output), (
+            torch.stack(next_hidden),
+            torch.stack(next_cell),
+        )
 
     def predict(
         self,
@@ -111,6 +192,12 @@ class TransducerPredictionDecoder(nn.Module):
         state: tuple[torch.Tensor, torch.Tensor] | None,
         rows: torch.Tensor,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if token_ids.device.type == "cpu" and token_ids.numel() == 1:
+            input_gates = self._input_gate_table()
+            if input_gates is not None:
+                return self._predict_from_input_gates(
+                    F.embedding(token_ids, input_gates), state, rows
+                )
         hidden_states = self.embedding(token_ids.unsqueeze(1))
         row_state = None
         if state is not None:

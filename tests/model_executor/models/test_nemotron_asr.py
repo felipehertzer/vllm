@@ -27,6 +27,7 @@ from vllm.model_executor.models.nemotron_asr import (
 )
 from vllm.model_executor.models.transducer_asr import (
     TransducerDecodeConfig,
+    TransducerPredictionDecoder,
     greedy_decode_transducer_batch,
     greedy_decode_transducer_batch_with_timestamps,
     strip_asr_special_tokens,
@@ -429,3 +430,51 @@ def test_strip_asr_special_tokens_preserves_words():
     assert strip_asr_special_tokens("<en-US> Forward [noise] pocket") == (
         "Forward pocket"
     )
+
+
+def test_cpu_prediction_gate_cache_matches_lstm_states_and_weight_updates():
+    """Frozen input projections must preserve recurrence and reload semantics."""
+    torch.manual_seed(713)
+    decoder = TransducerPredictionDecoder(
+        vocab_size=11, hidden_size=16, num_layers=2
+    ).eval()
+    rows = torch.tensor([0])
+    reference_state = None
+    optimized_state = None
+    with torch.inference_mode():
+        for token in (10, 3, 3, 7, 1):
+            labels = torch.tensor([token])
+            reference, reference_state = decoder.lstm(
+                decoder.embedding(labels[:, None]), reference_state
+            )
+            reference = decoder.decoder_projector(reference)[:, 0, :]
+            actual, optimized_state = decoder.predict_batch(
+                labels, optimized_state, rows
+            )
+            torch.testing.assert_close(actual, reference, atol=1e-6, rtol=1e-5)
+            for actual_state, expected_state in zip(
+                optimized_state, reference_state, strict=True
+            ):
+                torch.testing.assert_close(
+                    actual_state, expected_state, atol=1e-6, rtol=1e-5
+                )
+        previous_table = decoder._cpu_input_gate_cache
+        decoder.embedding.weight.add_(0.25)
+        labels = torch.tensor([2])
+        reference, _ = decoder.lstm(decoder.embedding(labels[:, None]))
+        actual, _ = decoder.predict_batch(labels, None, rows)
+        torch.testing.assert_close(
+            actual,
+            decoder.decoder_projector(reference)[:, 0, :],
+            atol=1e-6,
+            rtol=1e-5,
+        )
+        assert decoder._cpu_input_gate_cache is not previous_table
+
+
+def test_prediction_gate_cache_does_not_interfere_with_training():
+    decoder = TransducerPredictionDecoder(vocab_size=11, hidden_size=16, num_layers=2)
+    output, _ = decoder.predict_batch(torch.tensor([2]), None, torch.tensor([0]))
+    output.sum().backward()
+    assert decoder.embedding.weight.grad is not None
+    assert decoder._cpu_input_gate_cache is None
