@@ -59,19 +59,25 @@ def words_from_token_timesteps(
     frame_shift_seconds: float,
     duration_seconds: float,
 ) -> tuple[WordTimestamp, ...]:
-    """Word times as NeMo derives them from transducer token frames.
+    """The interval each word was spoken in, from transducer token frames.
 
-    A word starts at the frame that emits its first token and ends one frame
-    after the frame that emits its last spoken token. Punctuation joins the word
-    without extending it (the model often emits it only once the next word has
-    begun), and the silence before the next word is left out, so a word is never
-    stretched across a pause or a change of speaker.
+    A streaming transducer emits a word once it has heard it: the probability
+    of a word's first token stays near zero until the word is over, and the
+    frame after its last spoken token lands a median 0.1 s after the word ends
+    (forced alignment of 63 broadcast clips). So that frame is the word's end,
+    and all the model tells about its start is that it came after the previous
+    word ended. Each word is given that interval; words ending on the same
+    frame share it. NeMo stamps a word at its first token's frame, which for
+    this model is the word's end, so a word that ends just before a change of
+    speaker was placed after the change.
+
+    Punctuation joins a word without extending it: the model often emits it
+    only once the next word has begun.
     """
     timed_token_ids = list(token_ids[: len(timesteps)])
     tokens = tokenizer.convert_ids_to_tokens(timed_token_ids)
     special_ids = set(tokenizer.all_special_ids)
     texts: list[str] = []
-    start_frames: list[int] = []
     # The frame after each word's last spoken token.
     end_frames: list[int] = []
     # A bare "▁" token separates words: the next spoken piece starts one.
@@ -96,7 +102,6 @@ def words_from_token_timesteps(
         starts_word = token.startswith("▁") or boundary_pending
         if not texts or (starts_word and not punctuation):
             texts.append(piece)
-            start_frames.append(frame)
             end_frames.append(frame + 1)
             boundary_pending = False
             continue
@@ -104,23 +109,16 @@ def words_from_token_timesteps(
         if not punctuation:
             end_frames[-1] = frame + 1
 
-    # The encoder's last frame can start at the end of the audio; a word it
-    # emits still belongs to the audio's final frame rather than after it.
-    last_frame_start = max(0.0, duration_seconds - frame_shift_seconds)
     timestamped: list[WordTimestamp] = []
-    for word, start_frame, end_frame in zip(
-        texts, start_frames, end_frames, strict=True
-    ):
-        start = min(last_frame_start, start_frame * frame_shift_seconds)
+    start = previous_end = 0.0
+    for word, end_frame in zip(texts, end_frames, strict=True):
+        # The encoder's last frame can start at the end of the audio.
         end = min(duration_seconds, end_frame * frame_shift_seconds)
-        if word and end > start:
-            timestamped.append(
-                WordTimestamp(
-                    word=word,
-                    start=round(start, 3),
-                    end=round(end, 3),
-                )
-            )
+        if end > previous_end:
+            start, previous_end = previous_end, end
+        timestamped.append(
+            WordTimestamp(word=word, start=round(start, 3), end=round(end, 3))
+        )
     return tuple(timestamped)
 
 

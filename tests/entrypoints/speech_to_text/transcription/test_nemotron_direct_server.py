@@ -130,7 +130,7 @@ class _FakeTokenizer:
         return [vocabulary[token_id] for token_id in token_ids]
 
 
-def test_word_timestamps_follow_metaspace_boundaries_and_spoken_frames() -> None:
+def test_each_word_spans_from_the_previous_word_end_to_its_last_spoken_frame() -> None:
     words = words_from_token_timesteps(
         _FakeTokenizer(),  # type: ignore[arg-type]
         token_ids=[1, 2, 3, 4, 5, 7, 8, 10, 9],
@@ -141,15 +141,15 @@ def test_word_timestamps_follow_metaspace_boundaries_and_spoken_frames() -> None
 
     assert words == (
         WordTimestamp(word="Good", start=0.0, end=0.08),
-        WordTimestamp(word="morning,", start=0.16, end=0.32),
-        WordTimestamp(word="Australia's", start=0.64, end=0.8),
+        WordTimestamp(word="morning,", start=0.08, end=0.32),
+        WordTimestamp(word="Australia's", start=0.32, end=0.8),
         WordTimestamp(word="very", start=0.8, end=0.88),
     )
 
 
-def test_word_timestamps_leave_pauses_and_late_punctuation_out_of_words() -> None:
-    # "Good" is spoken at frame 0; its full stop is emitted after a pause, with
-    # the next word. Neither the pause nor the late punctuation lengthens it.
+def test_late_punctuation_does_not_lengthen_the_word_it_joins() -> None:
+    # "Good" is heard by frame 0; its full stop is emitted after a pause, with
+    # the next word, which may have started anywhere after "Good" ended.
     words = words_from_token_timesteps(
         _FakeTokenizer(),  # type: ignore[arg-type]
         token_ids=[1, 6, 5],
@@ -160,7 +160,23 @@ def test_word_timestamps_leave_pauses_and_late_punctuation_out_of_words() -> Non
 
     assert words == (
         WordTimestamp(word="Good.", start=0.0, end=0.08),
-        WordTimestamp(word="Australia", start=1.6, end=1.68),
+        WordTimestamp(word="Australia", start=0.08, end=1.68),
+    )
+
+
+def test_words_ending_on_the_same_frame_share_their_interval() -> None:
+    words = words_from_token_timesteps(
+        _FakeTokenizer(),  # type: ignore[arg-type]
+        token_ids=[1, 5, 13],
+        timesteps=[2, 5, 5],
+        frame_shift_seconds=0.08,
+        duration_seconds=1.0,
+    )
+
+    assert words == (
+        WordTimestamp(word="Good", start=0.0, end=0.24),
+        WordTimestamp(word="Australia", start=0.24, end=0.48),
+        WordTimestamp(word="than", start=0.24, end=0.48),
     )
 
 
@@ -177,7 +193,7 @@ def test_word_timestamps_keep_signs_with_the_word_they_start() -> None:
 
     assert words == (
         WordTimestamp(word="than", start=0.0, end=0.08),
-        WordTimestamp(word="$78", start=0.16, end=0.32),
+        WordTimestamp(word="$78", start=0.08, end=0.32),
     )
 
 
@@ -192,8 +208,8 @@ def test_word_timestamps_keep_a_word_emitted_on_the_closing_frame() -> None:
     )
 
     assert words == (
-        WordTimestamp(word="Good", start=29.6, end=29.68),
-        WordTimestamp(word="Australia", start=29.914, end=29.994),
+        WordTimestamp(word="Good", start=0.0, end=29.68),
+        WordTimestamp(word="Australia", start=29.68, end=29.994),
     )
 
 
