@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 from safetensors.torch import safe_open
 from transformers import PreTrainedTokenizerFast
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationConfig, CompilationMode
 from vllm.model_executor.models.nemotron_asr import NemotronASRForRNNT
@@ -369,6 +370,9 @@ def main() -> None:
     parser.add_argument("--max-upload-mb", type=int, default=100)
     parser.add_argument("--api-key", default=os.getenv("VLLM_API_KEY"))
     args = parser.parse_args()
+    # vLLM's GPU worker applies this to the models it runs; this server loads
+    # Nemotron itself in float32, so without it the encoder skips TF32 cores.
+    torch.set_float32_matmul_precision(envs.VLLM_FLOAT32_MATMUL_PRECISION)
 
     runtime = NemotronDirectRuntime(
         args.model,
