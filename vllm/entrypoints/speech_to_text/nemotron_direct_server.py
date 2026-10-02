@@ -89,7 +89,9 @@ def words_from_token_timesteps(
         if not piece:
             boundary_pending = True
             continue
-        punctuation = not any(character.isalnum() for character in piece)
+        # Only detachable sentence punctuation, as NVIDIA's runtime defines it:
+        # quotes, signs and symbols ("$", "%", "-") are part of the words.
+        punctuation = len(piece) <= 3 and not piece.strip(".,!?;:")
         frame = int(timestep)
         starts_word = token.startswith("▁") or boundary_pending
         if not texts or (starts_word and not punctuation):
