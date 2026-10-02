@@ -123,6 +123,9 @@ class _FakeTokenizer:
             8: "▁",
             9: "<eos>",
             10: "very",
+            11: "$",
+            12: "78",
+            13: "▁than",
         }
         return [vocabulary[token_id] for token_id in token_ids]
 
@@ -158,6 +161,23 @@ def test_word_timestamps_leave_pauses_and_late_punctuation_out_of_words() -> Non
     assert words == (
         WordTimestamp(word="Good.", start=0.0, end=0.08),
         WordTimestamp(word="Australia", start=1.6, end=1.68),
+    )
+
+
+def test_word_timestamps_keep_signs_with_the_word_they_start() -> None:
+    # "than $78": the bare boundary and "$" begin a word; only sentence
+    # punctuation attaches to the word before it.
+    words = words_from_token_timesteps(
+        _FakeTokenizer(),  # type: ignore[arg-type]
+        token_ids=[13, 8, 11, 12],
+        timesteps=[0, 2, 2, 3],
+        frame_shift_seconds=0.08,
+        duration_seconds=1.0,
+    )
+
+    assert words == (
+        WordTimestamp(word="than", start=0.0, end=0.08),
+        WordTimestamp(word="$78", start=0.16, end=0.32),
     )
 
 
