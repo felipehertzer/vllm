@@ -118,24 +118,62 @@ class _FakeTokenizer:
             3: "ing",
             4: ",",
             5: "▁Australia",
+            6: "▁.",
+            7: "'s",
+            8: "▁",
             9: "<eos>",
+            10: "very",
         }
         return [vocabulary[token_id] for token_id in token_ids]
 
 
-def test_word_timestamps_follow_metaspace_boundaries_and_audio_duration() -> None:
+def test_word_timestamps_follow_metaspace_boundaries_and_spoken_frames() -> None:
     words = words_from_token_timesteps(
         _FakeTokenizer(),  # type: ignore[arg-type]
-        token_ids=[1, 2, 3, 4, 5, 9],
-        timesteps=[0, 2, 3, 3, 8],
+        token_ids=[1, 2, 3, 4, 5, 7, 8, 10, 9],
+        timesteps=[0, 2, 3, 3, 8, 9, 10, 10],
         frame_shift_seconds=0.08,
         duration_seconds=1.0,
     )
 
     assert words == (
-        WordTimestamp(word="Good", start=0.0, end=0.16),
-        WordTimestamp(word="morning,", start=0.16, end=0.64),
-        WordTimestamp(word="Australia", start=0.64, end=1.0),
+        WordTimestamp(word="Good", start=0.0, end=0.08),
+        WordTimestamp(word="morning,", start=0.16, end=0.32),
+        WordTimestamp(word="Australia's", start=0.64, end=0.8),
+        WordTimestamp(word="very", start=0.8, end=0.88),
+    )
+
+
+def test_word_timestamps_leave_pauses_and_late_punctuation_out_of_words() -> None:
+    # "Good" is spoken at frame 0; its full stop is emitted after a pause, with
+    # the next word. Neither the pause nor the late punctuation lengthens it.
+    words = words_from_token_timesteps(
+        _FakeTokenizer(),  # type: ignore[arg-type]
+        token_ids=[1, 6, 5],
+        timesteps=[0, 20, 20],
+        frame_shift_seconds=0.08,
+        duration_seconds=2.0,
+    )
+
+    assert words == (
+        WordTimestamp(word="Good.", start=0.0, end=0.08),
+        WordTimestamp(word="Australia", start=1.6, end=1.68),
+    )
+
+
+def test_word_timestamps_keep_a_word_emitted_on_the_closing_frame() -> None:
+    # 29.994 s of audio has encoder frames up to 375, which starts at 30.0 s.
+    words = words_from_token_timesteps(
+        _FakeTokenizer(),  # type: ignore[arg-type]
+        token_ids=[1, 5],
+        timesteps=[370, 375],
+        frame_shift_seconds=0.08,
+        duration_seconds=29.994,
+    )
+
+    assert words == (
+        WordTimestamp(word="Good", start=29.6, end=29.68),
+        WordTimestamp(word="Australia", start=29.914, end=29.994),
     )
 
 
