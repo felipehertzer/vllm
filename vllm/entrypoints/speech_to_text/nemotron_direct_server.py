@@ -59,12 +59,23 @@ def words_from_token_timesteps(
     frame_shift_seconds: float,
     duration_seconds: float,
 ) -> tuple[WordTimestamp, ...]:
+    """Word times as NeMo derives them from transducer token frames.
+
+    A word starts at the frame that emits its first token and ends one frame
+    after the frame that emits its last spoken token. Punctuation joins the word
+    without extending it (the model often emits it only once the next word has
+    begun), and the silence before the next word is left out, so a word is never
+    stretched across a pause or a change of speaker.
+    """
     timed_token_ids = list(token_ids[: len(timesteps)])
     tokens = tokenizer.convert_ids_to_tokens(timed_token_ids)
     special_ids = set(tokenizer.all_special_ids)
-    words: list[tuple[str, float]] = []
-    current_parts: list[str] = []
-    current_start = 0.0
+    texts: list[str] = []
+    start_frames: list[int] = []
+    # The frame after each word's last spoken token.
+    end_frames: list[int] = []
+    # A bare "▁" token separates words: the next spoken piece starts one.
+    boundary_pending = False
 
     for token_id, token, timestep in zip(
         timed_token_ids,
@@ -74,24 +85,32 @@ def words_from_token_timesteps(
     ):
         if token_id in special_ids or token.startswith("<"):
             continue
-        starts_word = token.startswith("▁")
         piece = token.removeprefix("▁")
-        if starts_word and current_parts:
-            words.append(("".join(current_parts), current_start))
-            current_parts = []
-        if not current_parts:
-            current_start = min(
-                duration_seconds,
-                max(0.0, float(timestep) * frame_shift_seconds),
-            )
-        current_parts.append(piece)
-    if current_parts:
-        words.append(("".join(current_parts), current_start))
+        if not piece:
+            boundary_pending = True
+            continue
+        punctuation = not any(character.isalnum() for character in piece)
+        frame = int(timestep)
+        starts_word = token.startswith("▁") or boundary_pending
+        if not texts or (starts_word and not punctuation):
+            texts.append(piece)
+            start_frames.append(frame)
+            end_frames.append(frame + 1)
+            boundary_pending = False
+            continue
+        texts[-1] += piece
+        if not punctuation:
+            end_frames[-1] = frame + 1
 
+    # The encoder's last frame can start at the end of the audio; a word it
+    # emits still belongs to the audio's final frame rather than after it.
+    last_frame_start = max(0.0, duration_seconds - frame_shift_seconds)
     timestamped: list[WordTimestamp] = []
-    for index, (word, start) in enumerate(words):
-        next_start = words[index + 1][1] if index + 1 < len(words) else duration_seconds
-        end = min(duration_seconds, max(start + frame_shift_seconds, next_start))
+    for word, start_frame, end_frame in zip(
+        texts, start_frames, end_frames, strict=True
+    ):
+        start = min(last_frame_start, start_frame * frame_shift_seconds)
+        end = min(duration_seconds, end_frame * frame_shift_seconds)
         if word and end > start:
             timestamped.append(
                 WordTimestamp(
