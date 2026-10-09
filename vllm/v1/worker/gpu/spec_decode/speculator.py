@@ -486,6 +486,11 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> torch.Tensor:
         if draft_logits is None and self.use_local_argmax_reduction:
             return self.get_draft_top_tokens(hidden_states, spec_step_idx)
+        if (
+            draft_logits is None
+            and getattr(self.model, "draft_vocab_ids", None) is not None
+        ):
+            return self.model.greedy_draft_tokens(hidden_states)
 
         logits = self.compute_draft_logits(hidden_states, spec_step_idx)
         if draft_logits is not None and self.draft_watermarker is not None:

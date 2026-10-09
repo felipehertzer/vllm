@@ -493,6 +493,14 @@ class SpeculativeConfig:
     O(2 * tp_size) per token. Only applies to greedy draft selection in
     non-tree speculation."""
 
+    draft_vocab_path: str | None = None
+    """Path to a JSON list of target-vocabulary token ids the drafter may
+    propose. DFlash drafts with the target's full LM head; with this set, its
+    greedy draft logits use only these rows (FR-Spec style), which shrinks the
+    drafter's largest GEMM. The target still verifies against its full
+    vocabulary, so generated tokens are unchanged. Requires method='dflash'
+    and greedy draft sampling."""
+
     use_heterogeneous_vocab: bool = False
     """Allow draft and target models to use different vocabularies.
     When enabled, builds a token-level intersection at init and constrains
@@ -1953,6 +1961,26 @@ class SpeculativeConfig:
             self.draft_model_config.verify_with_parallel_config(
                 self.draft_parallel_config
             )
+
+        if self.draft_vocab_path is not None:
+            if self.method != "dflash":
+                raise ValueError("draft_vocab_path only works with method='dflash'")
+            if self.draft_sample_method != "greedy":
+                raise ValueError(
+                    "draft_vocab_path only supports greedy draft sampling. Set "
+                    "draft_sample_method='greedy' (the default) or omit it."
+                )
+            if self.use_local_argmax_reduction:
+                raise ValueError(
+                    "draft_vocab_path cannot be combined with "
+                    "use_local_argmax_reduction"
+                )
+            if self.enable_adaptive_verification:
+                raise ValueError(
+                    "Adaptive verification estimates per-position acceptance from "
+                    "the full draft logits, which draft_vocab_path never "
+                    "materializes. Disable one of them."
+                )
 
         if self.use_heterogeneous_vocab and not self.uses_draft_model():
             raise ValueError(

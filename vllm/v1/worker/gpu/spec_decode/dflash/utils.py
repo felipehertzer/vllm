@@ -3,14 +3,18 @@
 import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
+from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
+from vllm.v1.worker.gpu.spec_decode.draft_vocab import load_draft_vocab
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _should_share,
     get_target_lm_head,
     maybe_share_target_embed,
 )
 from vllm.v1.worker.gpu.spec_decode.utils import get_pp_safe_draft_load_config
+
+logger = init_logger(__name__)
 
 
 def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
@@ -71,5 +75,18 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         if draft_lm_head is not None:
             del dflash_model.lm_head
         dflash_model.lm_head = target_lm_head
+
+    if speculative_config.draft_vocab_path is not None:
+        dflash_model.set_draft_vocab(
+            load_draft_vocab(
+                speculative_config.draft_vocab_path,
+                vllm_config.model_config.get_vocab_size(),
+            )
+        )
+        logger.info(
+            "DFlash drafts from %d of %d vocabulary tokens",
+            dflash_model.draft_vocab_ids.numel(),
+            vllm_config.model_config.get_vocab_size(),
+        )
 
     return dflash_model
