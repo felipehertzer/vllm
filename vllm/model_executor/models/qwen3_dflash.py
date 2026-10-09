@@ -35,6 +35,10 @@ from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.worker.gpu.spec_decode.draft_vocab import (
+    draft_head_weight,
+    greedy_draft_tokens,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -687,6 +691,9 @@ class DFlashQwen3Model(nn.Module):
 
 class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
     model_cls = DFlashQwen3Model
+    # Set by set_draft_vocab() when drafting from a restricted vocabulary.
+    draft_vocab_ids: torch.Tensor | None = None
+    draft_head_weight: torch.Tensor | None = None
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
@@ -744,6 +751,31 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         """Per-layer attention causality, aligned with
         get_draft_kv_cache_layer_names."""
         return [layer.self_attn.causal for layer in self.model.layers]
+
+    def set_draft_vocab(self, token_ids: torch.Tensor) -> None:
+        """Draft only from these target token ids.
+
+        See SpeculativeConfig.draft_vocab_path. Call after the target's LM head
+        is shared with this drafter.
+        """
+        if self.draft_id_to_target_id is not None:
+            raise ValueError(
+                "draft_vocab_path cannot be used with a drafter that has its own "
+                "reduced vocabulary"
+            )
+        weight = getattr(self.lm_head, "weight", None)
+        if not isinstance(weight, torch.Tensor) or not weight.is_floating_point():
+            raise ValueError("draft_vocab_path needs an unquantized shared LM head")
+        # Plain tensor attributes: derived at load time, never checkpointed.
+        self.draft_head_weight = draft_head_weight(weight, token_ids)
+        self.draft_vocab_ids = token_ids.to(weight.device)
+
+    def greedy_draft_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Greedy drafts within the restricted vocabulary, as target token ids."""
+        assert self.draft_head_weight is not None and self.draft_vocab_ids is not None
+        return greedy_draft_tokens(
+            hidden_states, self.draft_head_weight, self.draft_vocab_ids
+        )
 
     def compute_logits(
         self,
