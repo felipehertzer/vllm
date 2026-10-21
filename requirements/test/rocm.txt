@@ -144,7 +144,7 @@ colorful==0.5.8
     # via ray
 colorlog==6.10.1
     # via optuna
-compressed-tensors==0.17.0
+compressed-tensors==0.17.1
     # via
     #   -c requirements/common.txt
     #   -r requirements/test/../common.txt
