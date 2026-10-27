@@ -892,11 +892,15 @@ class NemotronASRModel(nn.Module):
         return self.encoder_projector.weight.device
 
     def _move_decoder_stack(self, device: torch.device) -> None:
-        if self.prompt_kernel is not None:
-            self.prompt_kernel.to(device)
-        self.encoder_projector.to(device)
-        self.decoder.to(device)
-        self.joint.to(device)
+        # Callers run under inference_mode, where a moved module gets inference
+        # tensors as parameters. Those turn off the CPU decoder's input-gate
+        # table, leaving every prediction step to nn.LSTM (4.5x slower).
+        with torch.inference_mode(False):
+            if self.prompt_kernel is not None:
+                self.prompt_kernel.to(device)
+            self.encoder_projector.to(device)
+            self.decoder.to(device)
+            self.joint.to(device)
 
     def _prepare_encoder_decode_devices(
         self,

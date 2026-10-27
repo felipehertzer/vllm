@@ -472,6 +472,34 @@ def test_cpu_prediction_gate_cache_matches_lstm_states_and_weight_updates():
         assert decoder._cpu_input_gate_cache is not previous_table
 
 
+def test_decoder_stack_moves_outside_inference_mode():
+    """Moved under inference_mode, the decoder would get inference-tensor
+    parameters, which disable the CPU input-gate table."""
+    model = object.__new__(NemotronASRModel)
+    torch.nn.Module.__init__(model)
+    model.prompt_kernel = None
+    model.encoder_projector = torch.nn.Linear(4, 16)
+    model.decoder = TransducerPredictionDecoder(
+        vocab_size=11, hidden_size=16, num_layers=2
+    )
+    model.joint = torch.nn.Linear(16, 11)
+    modes = []
+    for module in (model.encoder_projector, model.decoder, model.joint):
+        original = module.to
+
+        def record(*args, _original=original, **kwargs):
+            modes.append(torch.is_inference_mode_enabled())
+            return _original(*args, **kwargs)
+
+        module.to = record
+
+    with torch.inference_mode():
+        model._move_decoder_stack(torch.device("cpu"))
+
+    assert modes == [False, False, False]
+    assert not any(parameter.is_inference() for parameter in model.decoder.parameters())
+
+
 def test_prediction_gate_cache_does_not_interfere_with_training():
     decoder = TransducerPredictionDecoder(vocab_size=11, hidden_size=16, num_layers=2)
     output, _ = decoder.predict_batch(torch.tensor([2]), None, torch.tensor([0]))
