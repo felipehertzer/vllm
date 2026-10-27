@@ -649,6 +649,7 @@ _MULTIMODAL_MODELS = {
         "nemotron_parse3_5",
         "RadioMBartPrefixForCausalLM",
     ),
+    "NemotronASRForRNNT": ("nemotron_asr", "NemotronASRForRNNT"),
     "WhisperForConditionalGeneration": ("whisper", "WhisperForConditionalGeneration"),
 }
 

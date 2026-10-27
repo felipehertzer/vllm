@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -241,6 +242,18 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+def _transducer_asr_profile_enabled() -> bool:
+    return any(
+        os.getenv(name, "").lower() in {"1", "true", "yes", "on"}
+        for name in ("NEMOTRON_ASR_PROFILE", "TRANSDUCER_ASR_PROFILE")
+    )
+
+
+def _sync_if_cuda(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.accelerator.synchronize(device)
 
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
@@ -523,6 +536,22 @@ class GPUModelRunner(
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
+        self.is_transducer_asr = bool(
+            "NemotronASRForRNNT" in set(getattr(model_config, "architectures", ()))
+        )
+        self.transducer_asr_uses_prompt_ids = "NemotronASRForRNNT" in set(
+            getattr(model_config, "architectures", ())
+        )
+        self.transducer_asr_forced_decoder_sequences: dict[str, list[int]] = {}
+        self.transducer_asr_forced_decoder_ids = (
+            torch.empty(
+                self.max_num_tokens,
+                dtype=torch.long,
+                device=self.device,
+            )
+            if self.is_transducer_asr
+            else None
+        )
 
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
@@ -1188,6 +1217,7 @@ class GPUModelRunner(
             req_state = self.requests.pop(req_id, None)
             self._on_request_state_removed(req_id, req_state)
             self.num_prompt_logprobs.pop(req_id, None)
+            self.transducer_asr_forced_decoder_sequences.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -2959,6 +2989,122 @@ class GPUModelRunner(
 
         return encoder_outputs
 
+    def _get_transducer_asr_encoder_output_req_ids(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> list[str]:
+        req_ids: list[str] = []
+        for (
+            req_id,
+            encoder_input_ids,
+        ) in scheduler_output.scheduled_encoder_inputs.items():
+            req_state = self.requests[req_id]
+            for mm_input_id in encoder_input_ids:
+                mm_feature = req_state.mm_features[mm_input_id]
+                if mm_feature.data is None:
+                    continue
+                req_ids.append(req_id)
+        return req_ids
+
+    def _decode_transducer_asr_encoder_outputs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        encoder_outputs: Sequence[torch.Tensor],
+    ) -> None:
+        if not encoder_outputs:
+            return
+
+        req_ids = self._get_transducer_asr_encoder_output_req_ids(scheduler_output)
+        if len(req_ids) != len(encoder_outputs):
+            raise ValueError(
+                "Transducer ASR encoder output count does not match scheduled "
+                f"request count: {len(encoder_outputs)} != {len(req_ids)}."
+            )
+
+        profile = _transducer_asr_profile_enabled()
+        if profile:
+            _sync_if_cuda(self.device)
+            started_at = time.perf_counter()
+        if self.transducer_asr_uses_prompt_ids:
+            hf_config = self.model_config.hf_config
+            default_prompt_id = int(hf_config.prompt_id_for_language(None))
+            prompt_ids = torch.tensor(
+                [
+                    int(
+                        (
+                            getattr(
+                                self.requests[req_id].sampling_params,
+                                "extra_args",
+                                None,
+                            )
+                            or {}
+                        ).get("transducer_asr_prompt_id", default_prompt_id)
+                    )
+                    for req_id in req_ids
+                ],
+                dtype=torch.long,
+                device=self.device,
+            )
+            sequences = self.model.model.greedy_decode_batch(
+                encoder_outputs,
+                prompt_ids=prompt_ids,
+            )
+        else:
+            sequences = self.model.model.greedy_decode_batch(encoder_outputs)
+        if profile:
+            _sync_if_cuda(self.device)
+            decode_ms = (time.perf_counter() - started_at) * 1000
+            output_tokens = sum(len(sequence) for sequence in sequences)
+            logger.info(
+                "Transducer ASR profile decode_ms=%.2f chunks=%d output_tokens=%d",
+                decode_ms,
+                len(encoder_outputs),
+                output_tokens,
+            )
+        for req_id, sequence in zip(req_ids, sequences, strict=True):
+            self.transducer_asr_forced_decoder_sequences[req_id] = sequence
+
+    def _get_transducer_asr_forced_decoder_ids(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_input_tokens: int,
+    ) -> torch.Tensor:
+        eos_token_id = int(self.model_config.hf_config.eos_token_id)
+        forced_decoder_ids: list[int] = []
+
+        for req_index, req_id in enumerate(self.input_batch.req_ids):
+            num_scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            # Transducer ASR pre-decodes the transcription once from the encoder
+            # output. The forced sequence is indexed by generated output tokens,
+            # not by vLLM's request-level computed-token counter, which also
+            # includes encoder/prompt bookkeeping for encoder-decoder models.
+            start_pos = len(self.requests[req_id].output_token_ids)
+            sequence = self.transducer_asr_forced_decoder_sequences.get(req_id, ())
+            for position in range(start_pos, start_pos + num_scheduled):
+                if 0 <= position < len(sequence):
+                    token_id = sequence[position]
+                else:
+                    token_id = eos_token_id
+                forced_decoder_ids.append(token_id)
+
+        if len(forced_decoder_ids) < num_input_tokens:
+            pad_token_id = (
+                forced_decoder_ids[-1] if forced_decoder_ids else eos_token_id
+            )
+            forced_decoder_ids.extend(
+                [pad_token_id] * (num_input_tokens - len(forced_decoder_ids))
+            )
+
+        assert self.transducer_asr_forced_decoder_ids is not None
+        self.transducer_asr_forced_decoder_ids[:num_input_tokens].copy_(
+            torch.tensor(
+                forced_decoder_ids[:num_input_tokens],
+                dtype=torch.long,
+                device=self.device,
+            )
+        )
+        return self.transducer_asr_forced_decoder_ids[:num_input_tokens]
+
     def _get_encoder_output_from_cache(self, mm_hash: str) -> torch.Tensor | None:
         """Return a cached encoder output for multimodal
         embedding gather."""
@@ -3386,10 +3532,22 @@ class GPUModelRunner(
             # Run the encoder, just like we do with other multimodal inputs.
             # For an encoder-decoder model, our processing here is a bit
             # simpler, because the outputs are just passed to the decoder.
-            # We are not doing any prompt replacement. We also will only
-            # ever have a single encoder input.
+            # We are not doing any prompt replacement.
             encoder_outputs = self._execute_mm_encoder(scheduler_output)
-            model_kwargs.update({"encoder_outputs": encoder_outputs})
+            if self.is_transducer_asr:
+                self._decode_transducer_asr_encoder_outputs(
+                    scheduler_output, encoder_outputs
+                )
+            else:
+                model_kwargs.update({"encoder_outputs": encoder_outputs})
+
+        if self.is_transducer_asr:
+            model_kwargs["forced_decoder_ids"] = (
+                self._get_transducer_asr_forced_decoder_ids(
+                    scheduler_output,
+                    num_input_tokens,
+                )
+            )
 
         return (
             input_ids,
@@ -5762,6 +5920,15 @@ class GPUModelRunner(
                 num_tokens_padded = ubatch_slices_padded[0].num_tokens
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
+
+            if self.is_transducer_asr:
+                assert self.transducer_asr_forced_decoder_ids is not None
+                self.transducer_asr_forced_decoder_ids[:num_tokens_padded].fill_(
+                    int(self.model_config.hf_config.eos_token_id)
+                )
+                model_kwargs["forced_decoder_ids"] = (
+                    self.transducer_asr_forced_decoder_ids[:num_tokens_padded]
+                )
 
             with (
                 self.maybe_randomize_inputs(

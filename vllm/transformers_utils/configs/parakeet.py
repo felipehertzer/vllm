@@ -53,11 +53,22 @@ class ExtractorConfig:
     preemphasis: float = 0.97
     n_fft: int = 512
     padding_value: float = 0.0
+    normalize: str = "per_feature"
+    count_final_stft_frame: bool = False
+    """Treat the last centered-STFT frame as valid audio (Nemotron ASR)."""
 
     @classmethod
     def from_hf_config(cls, config: PreTrainedConfig) -> "ExtractorConfig":
         assert isinstance(config, PreTrainedConfig)
-        defaults = ("hop_length", "win_length", "preemphasis", "n_fft", "padding_value")
+        defaults = (
+            "hop_length",
+            "win_length",
+            "preemphasis",
+            "n_fft",
+            "padding_value",
+            "normalize",
+            "count_final_stft_frame",
+        )
         optional_kwargs = {
             name: getattr(config, name) for name in defaults if hasattr(config, name)
         }

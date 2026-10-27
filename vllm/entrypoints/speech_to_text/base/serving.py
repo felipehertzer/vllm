@@ -3,6 +3,7 @@
 import asyncio
 import io
 import math
+import os
 import time
 import zlib
 from collections.abc import AsyncGenerator, Callable, Set
@@ -77,6 +78,16 @@ ResponseType: TypeAlias = (
 )
 
 logger = init_logger(__name__)
+
+
+def _transducer_asr_profile_enabled() -> bool:
+    return any(
+        os.getenv(env_name, "").lower() in {"1", "true", "yes", "on"}
+        for env_name in (
+            "NEMOTRON_ASR_PROFILE",
+            "TRANSDUCER_ASR_PROFILE",
+        )
+    )
 
 
 def asr_inter_chunk_separator(
@@ -274,7 +285,22 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         )
 
         # Run cpu intensive preprocess step in a separate thread pool executor.
-        chunks, duration = await self._decode_and_chunk_speech_async(audio_data)
+        decode_started_at = time.perf_counter()
+        try:
+            chunks, duration = await self._decode_and_chunk_speech_async(audio_data)
+        except Exception as exc:
+            raise VLLMValidationError(
+                "Invalid or unsupported audio file.", parameter="file"
+            ) from exc
+        if _transducer_asr_profile_enabled():
+            logger.info(
+                "Transducer ASR STT profile request_id=%s audio_decode_ms=%.2f "
+                "chunks=%d duration_s=%.2f",
+                request_id,
+                (time.perf_counter() - decode_started_at) * 1000,
+                len(chunks),
+                duration,
+            )
 
         chunk_start_offsets: list[float] = [0.0]
 
@@ -428,6 +454,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
     ) -> T | V | AsyncGenerator[str, None] | ErrorResponse:
         """Base method for speech-to-text operations like transcription and
         translation."""
+        request_started_at = time.perf_counter()
         if request.stream and request.use_beam_search:
             return self.create_error_response(
                 "Streaming is not currently supported with beam search"
@@ -527,6 +554,20 @@ class SpeechToTextBaseServing(GenerateBaseServing):
 
         if request.response_format == "verbose_json":
             sampling_params.logprobs = 1
+
+        update_sampling_params = getattr(
+            self.model_cls,
+            "update_speech_to_text_sampling_params",
+            None,
+        )
+        if update_sampling_params is not None and isinstance(
+            sampling_params, SamplingParams
+        ):
+            update_sampling_params(
+                sampling_params=sampling_params,
+                model_config=self.model_config,
+                language=request.language,
+            )
 
         engine_request_ids = [
             request_id if len(engine_inputs) == 1 else f"{request_id}-{idx}"
@@ -698,6 +739,13 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                             segments=total_segments,
                         ),
                     )
+            if _transducer_asr_profile_enabled():
+                total_ms = (time.perf_counter() - request_started_at) * 1000
+                logger.info(
+                    "Transducer ASR STT profile request_id=%s total_ms=%.2f",
+                    request_id,
+                    total_ms,
+                )
             return final_response
         except asyncio.CancelledError:
             logger.info(

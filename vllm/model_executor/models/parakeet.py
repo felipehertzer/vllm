@@ -220,11 +220,17 @@ class ParakeetExtractor:
             audio_lengths + self.config.n_fft // 2 * 2 - self.config.n_fft,
             self.config.hop_length,
         )
+        if self.config.count_final_stft_frame:
+            features_lengths = torch.clamp(
+                features_lengths + 1, max=mel_features.shape[1]
+            )
         attention_mask = (
             torch.arange(mel_features.shape[1], device=mel_features.device)[None, :]
             < features_lengths[:, None]
         )
         mask = attention_mask.unsqueeze(-1)
+        if self.config.normalize == "NA":
+            return mel_features * mask, attention_mask
         lengths = attention_mask.sum(dim=1)
         mel_features_masked = mel_features * mask
         mean = (mel_features_masked.sum(dim=1) / lengths.unsqueeze(-1)).unsqueeze(1)

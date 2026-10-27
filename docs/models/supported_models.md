@@ -745,6 +745,7 @@ Speech2Text models trained specifically for Automatic Speech Recognition.
 | `GlmAsrForConditionalGeneration` | GLM-ASR | `zai-org/GLM-ASR-Nano-2512` | ✅︎ | ✅︎ |
 | `GraniteSpeechForConditionalGeneration` | Granite Speech | `ibm-granite/granite-4.0-1b-speech`, `ibm-granite/granite-speech-3.3-2b`, etc. | ✅︎ | ✅︎ |
 | `GraniteSpeechPlusForConditionalGeneration` | Granite Speech Plus | `ibm-granite/granite-speech-4.1-2b-plus` | ✅︎ | ✅︎ |
+| `NemotronASRForRNNT` | NVIDIA Nemotron ASR Streaming | `nvidia/nemotron-3.5-asr-streaming-0.6b` | | |
 | `MossTranscribeDiarizeForConditionalGeneration` | MOSS-Transcribe-Diarize | `OpenMOSS-Team/MOSS-Transcribe-Diarize` | | ✅︎ |
 | `Qwen3ASRForConditionalGeneration` | Qwen3-ASR | `Qwen/Qwen3-ASR-1.7B`, etc. | ✅︎ | ✅︎ |
 | `Qwen3OmniMoeThinkerForConditionalGeneration` | Qwen3-Omni | `Qwen/Qwen3-Omni-30B-A3B-Instruct`, etc. | | ✅︎ |
@@ -752,6 +753,10 @@ Speech2Text models trained specifically for Automatic Speech Recognition.
 | `WhisperForConditionalGeneration` | Whisper | `openai/whisper-small`, `openai/whisper-large-v3-turbo`, etc. | | |
 
 !!! note
+    `NemotronASRForRNNT` converts NVIDIA's NeMo archive to a cached
+    safetensors layout on first use. Its RNN-T decoder is request-stateful, so
+    CUDA graph replay and speculative decoding are not supported.
+
     `VoxtralForConditionalGeneration` requires `mistral-common[audio]` to be installed.
 
 #### Realtime Transcription

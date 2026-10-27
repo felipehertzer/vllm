@@ -158,6 +158,7 @@ _CONFIG_REGISTRY: dict[str, type[PreTrainedConfig]] = LazyConfigDict(
     moss_transcribe_diarize="MossTranscribeDiarizeConfig",
     eagle="EAGLEConfig",
     speculators="SpeculatorsConfig",
+    nemotron_asr="NemotronASRConfig",
     openvla="OpenVLAConfig",
     ovis="OvisConfig",
     ultravox="UltravoxConfig",
