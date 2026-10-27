@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from transformers import ParakeetEncoderConfig
 from transformers.feature_extraction_utils import BatchFeature
 
+from vllm.model_executor.models import nemotron_asr
 from vllm.model_executor.models.config import (
     MODELS_CONFIG_MAP,
     NemotronASRForRNNTConfig,
@@ -24,6 +25,8 @@ from vllm.model_executor.models.nemotron_asr import (
     NemotronASRForRNNT,
     NemotronASRModel,
     NemotronASRMultiModalProcessor,
+    _nemotron_chunked_attention,
+    _nemotron_eager_attention,
 )
 from vllm.model_executor.models.transducer_asr import (
     TransducerDecodeConfig,
@@ -296,6 +299,68 @@ def test_nemotron_encoder_uses_chunked_limited_attention_mask():
     assert not bool(mask[0, 0, 1, 2])
     assert bool(mask[0, 0, 4, 2])
     assert not bool(mask[0, 0, 4, 0])
+
+
+@pytest.mark.parametrize("seq_length", [1, 5, 13, 30])
+def test_nemotron_chunked_attention_matches_dense_mask(seq_length):
+    """The windowed computation must equal attention under the dense
+    chunked_limited mask, including padded frames and short sequences."""
+    torch.manual_seed(0)
+    batch_size, num_heads, head_dim, chunk_size, left_chunks = 2, 2, 4, 3, 2
+    query_u, query_v, key, value = (
+        torch.randn(batch_size, num_heads, seq_length, head_dim) for _ in range(4)
+    )
+    relative_key = torch.randn(batch_size, num_heads, 2 * seq_length - 1, head_dim)
+    valid = torch.ones(batch_size, seq_length, dtype=torch.bool)
+    valid[1, max(1, seq_length * 2 // 3) :] = False
+    chunk = torch.arange(seq_length) // chunk_size
+    chunk_distance = chunk[:, None] - chunk[None, :]
+    dense_mask = ((chunk_distance >= 0) & (chunk_distance <= left_chunks))[None]
+    dense_mask = dense_mask & valid[:, None, :] & valid[:, :, None]
+
+    expected = _nemotron_eager_attention(
+        query_u, query_v, key, value, relative_key, dense_mask[:, None], 0.5
+    )
+    actual = _nemotron_chunked_attention(
+        query_u, query_v, key, value, relative_key, valid, 0.5, chunk_size, left_chunks
+    )
+
+    torch.testing.assert_close(
+        actual.transpose(1, 2)[valid], expected.transpose(1, 2)[valid]
+    )
+
+
+def test_nemotron_encoder_windowed_attention_matches_dense_mask(monkeypatch):
+    """The encoder with windowed attention gives the dense-mask result."""
+    config = ParakeetEncoderConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+        num_mel_bins=128,
+        subsampling_conv_channels=4,
+        subsampling_factor=8,
+        causal_downsampling=True,
+        conv_causal=True,
+        conv_norm_type="layer_norm",
+        att_context_style="chunked_limited",
+        att_context_left=4,
+        att_context_right=1,
+    )
+    torch.manual_seed(0)
+    encoder = NemotronASREncoder(config).eval()
+    features = torch.randn(1, 400, 128)
+    mask = torch.ones(1, 400, dtype=torch.bool)
+
+    with torch.inference_mode():
+        windowed = encoder(input_features=features, attention_mask=mask)
+        monkeypatch.setattr(nemotron_asr, "_nemotron_attention_window", lambda _: None)
+        for layer in encoder.layers:
+            layer.self_attn.window = None
+        dense = encoder(input_features=features, attention_mask=mask)
+
+    torch.testing.assert_close(windowed.last_hidden_state, dense.last_hidden_state)
 
 
 def test_nemotron_config_updates_runtime_metadata():
