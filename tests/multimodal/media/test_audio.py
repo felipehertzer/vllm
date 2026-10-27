@@ -16,10 +16,12 @@ from vllm.multimodal.media import AudioMediaIO
 from vllm.multimodal.media import audio as audio_module
 from vllm.multimodal.media.audio import (
     load_audio,
+    load_audio_pyav,
     load_audio_soundfile,
     load_audio_torchcodec,
 )
 from vllm.multimodal.media.base import MediaDecodedBudget
+from vllm.utils.import_utils import PlaceholderModule
 
 from ...conftest import AudioTestAssets
 
@@ -394,3 +396,79 @@ def test_torchcodec_max_decode_bytes_rejected(dummy_audio_bytes):
             sr=None,
             max_decode_bytes=audio.nbytes - 1,
         )
+
+
+def _pcm_bytes(signal: np.ndarray, channels: int, fmt: str, subtype: str) -> bytes:
+    buf = BytesIO()
+    data = np.repeat(signal[:, None], channels, axis=1)
+    sf.write(buf, data, 16000, format=fmt, subtype=subtype)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("fmt", "subtype", "atol"),
+    [
+        ("WAV", "PCM_16", 1e-4),
+        ("WAV", "PCM_32", 1e-4),
+        ("WAV", "PCM_U8", 1e-2),
+        ("FLAC", "PCM_16", 1e-4),
+    ],
+)
+@pytest.mark.parametrize("channels", [1, 2])
+def test_load_audio_pyav_scales_integer_pcm_at_native_rate(
+    fmt, subtype, atol, channels
+):
+    """Integer and interleaved PCM decoded at the native rate must come back
+    as mono float in [-1, 1], the same as audio that needs resampling."""
+    signal = 0.5 * np.sin(np.linspace(0, 40 * np.pi, 1600)).astype(np.float32)
+    payload = _pcm_bytes(signal, channels, fmt, subtype)
+
+    y, sr = load_audio_pyav(BytesIO(payload), sr=16000)
+
+    assert sr == 16000
+    assert y.shape == signal.shape
+    np.testing.assert_allclose(y, signal, atol=atol)
+
+
+def test_load_audio_without_soundfile_decodes_with_pyav():
+    """Without torchcodec and soundfile every format goes to PyAV, quietly."""
+    signal = 0.5 * np.sin(np.linspace(0, 40 * np.pi, 1600)).astype(np.float32)
+    payload = _pcm_bytes(signal, 1, "WAV", "PCM_16")
+
+    with (
+        patch.object(audio_module, "load_audio_torchcodec", side_effect=ImportError),
+        patch.object(audio_module, "soundfile", PlaceholderModule("soundfile")),
+        patch.object(audio_module, "logger") as logger,
+    ):
+        y, sr = load_audio(BytesIO(payload), sr=16000)
+
+    assert sr == 16000
+    np.testing.assert_allclose(y, signal, atol=1e-4)
+    logger.error.assert_not_called()
+    logger.info_once.assert_called_once()
+
+
+def test_load_audio_reports_missing_torchcodec_once_per_cause(dummy_audio_bytes):
+    """A missing torchcodec is the same for every request, so the fallback
+    warning goes through warning_once with a hashable cause."""
+    with (
+        patch.object(
+            audio_module,
+            "load_audio_torchcodec",
+            side_effect=lambda *args, **kwargs: (_ for _ in ()).throw(
+                ImportError("torchcodec missing")
+            ),
+        ),
+        patch.object(audio_module, "logger") as logger,
+    ):
+        load_audio(BytesIO(dummy_audio_bytes), sr=None)
+        load_audio(BytesIO(dummy_audio_bytes), sr=None)
+
+    logger.warning.assert_not_called()
+    assert logger.warning_once.call_count == 2
+    assert {call.args for call in logger.warning_once.call_args_list} == {
+        (
+            "torchcodec unavailable (%s); falling back to soundfile/PyAV.",
+            "torchcodec missing",
+        )
+    }

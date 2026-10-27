@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import math
 from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
@@ -91,9 +90,8 @@ def load_audio_pyav(
 ) -> tuple[npt.NDArray, float]:
     """Load an audio file using PyAV (FFmpeg), returning float32 mono waveform.
 
-    Decodes the audio stream at its native sample rate. Channel reduction to
-    mono is performed by averaging across channels.  Resampling to a
-    model-specific rate is left to the downstream :class:`AudioResampler`.
+    Every decoded frame is converted to planar float32 at ``sr`` (the native
+    rate when ``sr`` is None). With ``mono``, the channels are averaged.
 
     Args:
         path: A :class:`~io.BytesIO` buffer, a filesystem
@@ -150,28 +148,15 @@ def load_audio_pyav(
         total_decode_bytes = 0
 
         chunks: list[npt.NDArray] = []
-        needs_resampling = not math.isclose(
-            float(sr),
-            float(native_sr),
-            rel_tol=0.0,
-            abs_tol=1e-6,
-        )
-        resampler = (
-            av.AudioResampler(format="fltp", layout="mono", rate=sr)
-            if needs_resampling
-            else None
-        )
+        # Also at the native rate: decoders return integer or interleaved
+        # samples (PCM WAV, FLAC), and the resampler turns any of them into
+        # planar float32 in [-1, 1]. Channels are kept and averaged below;
+        # FFmpeg's float downmix sums them at -3 dB instead.
+        resampler = av.AudioResampler(format="fltp", rate=sr)
         try:
             for frame in container.decode(stream):
-                if needs_resampling:
-                    assert resampler is not None
-                    for out_frame in resampler.resample(frame):
-                        arr = out_frame.to_ndarray()
-                        total_samples += arr.shape[-1]
-                        total_decode_bytes += arr.nbytes
-                        chunks.append(arr)
-                else:
-                    arr = frame.to_ndarray()
+                for out_frame in resampler.resample(frame):
+                    arr = out_frame.to_ndarray()
                     total_samples += arr.shape[-1]
                     total_decode_bytes += arr.nbytes
                     chunks.append(arr)
@@ -477,32 +462,35 @@ def load_audio(
         )
     except ImportError as exc:
         # Decode errors don't defer: FFmpeg-based PyAV would fail the same way.
-        logger.warning(
-            "torchcodec unavailable (%r); falling back to soundfile/PyAV.", exc
+        # The cause is the same for every request, so it is logged once.
+        logger.warning_once(
+            "torchcodec unavailable (%s); falling back to soundfile/PyAV.", str(exc)
         )
 
-    if isinstance(path, BytesIO):
-        path.seek(0)
-    try:
-        return load_audio_soundfile(
-            path,
-            sr=sr,
-            mono=mono,
-            max_duration_s=max_duration_s,
-            max_decode_bytes=max_decode_bytes,
-        )
-    except ImportError as exc:
-        # Reach the LibsndfileError clause below only if exc is not an
-        # ImportError — i.e. soundfile is a real module — so evaluating
-        # ``soundfile.LibsndfileError`` here is safe even when soundfile is a
-        # PlaceholderModule (which would make that attribute access raise).
-        logger.error("Failed to load audio via soundfile: %r", exc)
-    except soundfile.LibsndfileError as exc:
-        # libsndfile covers fewer containers than FFmpeg, so defer only on a
-        # format-detection failure; re-raise anything else (e.g. corrupt but
-        # recognised) since PyAV would hit the same corruption.
-        if exc.code not in _BAD_SF_CODES:
-            raise
+    if isinstance(soundfile, PlaceholderModule):
+        # soundfile is optional: without it PyAV decodes every format.
+        logger.info_once("soundfile is not installed; decoding audio with PyAV.")
+    else:
+        if isinstance(path, BytesIO):
+            path.seek(0)
+        try:
+            return load_audio_soundfile(
+                path,
+                sr=sr,
+                mono=mono,
+                max_duration_s=max_duration_s,
+                max_decode_bytes=max_decode_bytes,
+            )
+        except ImportError as exc:
+            # A dependency of the soundfile path (PyAV for resampling) is
+            # missing; PyAV below then raises its own install hint.
+            logger.error("Failed to load audio via soundfile: %r", exc)
+        except soundfile.LibsndfileError as exc:
+            # libsndfile covers fewer containers than FFmpeg, so defer only on
+            # a format-detection failure; re-raise anything else (e.g. corrupt
+            # but recognised) since PyAV would hit the same corruption.
+            if exc.code not in _BAD_SF_CODES:
+                raise
 
     # PyAV is terminal: nothing left to fall back to. Normalize an FFmpeg
     # failure to ValueError; let a missing soundfile/PyAV surface its
