@@ -2584,12 +2584,14 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
 
             reset_buffer_cache()
         torch.accelerator.empty_cache()
-        try:
-            torch.accelerator.empty_host_cache()
-        except AttributeError:
-            logger.warning(
-                "torch.accelerator.empty_host_cache() only available in Pytorch >=2.9"
-            )
+        if not current_platform.is_mps():
+            try:
+                torch.accelerator.empty_host_cache()
+            except AttributeError:
+                logger.warning(
+                    "torch.accelerator.empty_host_cache() only available in "
+                    "Pytorch >=2.9"
+                )
 
     logger.debug_once("[shutdown] Distributed: cleanup complete")
 

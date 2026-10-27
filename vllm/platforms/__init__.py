@@ -162,6 +162,32 @@ def xpu_platform_plugin() -> str | None:
     return "vllm.platforms.xpu.XPUPlatform" if is_xpu else None
 
 
+def mps_platform_plugin() -> str | None:
+    logger.debug("Checking if MPS platform is available.")
+    if envs.VLLM_TARGET_DEVICE != "mps":
+        logger.debug("MPS platform is not selected by VLLM_TARGET_DEVICE.")
+        return None
+
+    try:
+        import sys
+
+        import torch
+
+        is_mps = (
+            sys.platform.startswith("darwin")
+            and torch.backends.mps.is_built()
+            and torch.backends.mps.is_available()
+        )
+        if is_mps:
+            logger.debug("Confirmed MPS platform is available.")
+            return "vllm.platforms.mps.MpsPlatform"
+        logger.debug("MPS platform is not available in this PyTorch build.")
+    except Exception as e:
+        logger.debug("MPS platform is not available because: %s", str(e))
+
+    return None
+
+
 def _is_amd_zen_cpu() -> bool:
     """Detect AMD CPU with AVX-512 via /proc/cpuinfo."""
     if not os.path.exists("/proc/cpuinfo"):
@@ -173,6 +199,9 @@ def _is_amd_zen_cpu() -> bool:
 
 def cpu_platform_plugin() -> str | None:
     logger.debug("Checking if CPU platform is available.")
+    if envs.VLLM_TARGET_DEVICE == "mps":
+        logger.debug("CPU platform is not activated because MPS was requested.")
+        return None
     is_cpu = envs.VLLM_TARGET_DEVICE == "cpu"
     if is_cpu:
         logger.debug(
@@ -233,6 +262,7 @@ builtin_platform_plugins = {
     "cuda": cuda_platform_plugin,
     "rocm": rocm_platform_plugin,
     "xpu": xpu_platform_plugin,
+    "mps": mps_platform_plugin,
     "cpu": cpu_platform_plugin,
 }
 

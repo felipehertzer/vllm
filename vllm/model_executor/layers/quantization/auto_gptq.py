@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from copy import deepcopy
+from functools import cache
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 from transformers import PreTrainedConfig
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe  # noqa
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
@@ -59,11 +63,144 @@ from vllm.model_executor.parameter import (
     PackedColumnParameter,
     PackedvLLMParameter,
 )
+from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.config import get_safetensors_params_metadata
 from vllm.utils.collection_utils import is_list_of
 
 logger = init_logger(__name__)
+
+
+_MPS_GPTQ_BACKEND_NAME = "MPSDequantLinearKernel"
+_MPS_GPTQ_DIRECT_MIN_OUTPUT_SIZE = 8192
+_MPS_GPTQ_DIRECT_ZERO_WORD = 0x77777777
+_MPS_GPTQ_PROFILE_TOTALS: dict[str, float] = {}
+_MPS_GPTQ_PROFILE_COUNTS: dict[str, int] = {}
+
+
+_MPS_GPTQ_DIRECT_GEMV_SRC = r"""
+#include <metal_stdlib>
+using namespace metal;
+
+#define SIMD_THREADS 32
+#define VEC8 8
+
+kernel void gptq_gemv_vec8_simd32(device const half* x,
+                                  device const int* qweight,
+                                  device const half* scales,
+                                  device half* out,
+                                  constant uint& N,
+                                  constant uint& K,
+                                  constant uint& G,
+                                  uint tid [[thread_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]],
+                                  uint2 tg [[threadgroup_position_in_grid]]) {
+  uint n0 = tg.y * VEC8;
+  float acc[VEC8];
+
+  for (uint j = 0; j < VEC8; ++j) {
+    acc[j] = 0.0f;
+  }
+
+  for (uint k = tid; k < K; k += SIMD_THREADS) {
+    uint k_pack = k >> 3;
+    uint k_shift = (k & 7u) << 2;
+    uint group = k / G;
+    float xv = float(x[k]);
+    for (uint j = 0; j < VEC8; ++j) {
+      uint n = n0 + j;
+      if (n < N) {
+        int packed = qweight[k_pack * N + n];
+        int w = (packed >> k_shift) & 0xF;
+        float wv = (float(w) - 8.0f) * float(scales[group * N + n]);
+        acc[j] = fma(xv, wv, acc[j]);
+      }
+    }
+  }
+
+  for (uint j = 0; j < VEC8; ++j) {
+    uint n = n0 + j;
+    if (n < N) {
+      float total = simd_sum(acc[j]);
+      if (lane == 0) {
+        out[n] = half(total);
+      }
+    }
+  }
+}
+"""
+
+
+@cache
+def _get_mps_gptq_direct_gemv_lib():
+    return torch.mps.compile_shader(_MPS_GPTQ_DIRECT_GEMV_SRC)
+
+
+def _mps_gptq_profile_active(x: torch.Tensor) -> bool:
+    return x.device.type == "mps" and envs.VLLM_MPS_PROFILE
+
+
+def _mps_gptq_profile_start(x: torch.Tensor) -> float:
+    torch.mps.synchronize()
+    return time.perf_counter()
+
+
+def _mps_gptq_profile_log(name: str, started: float, x: torch.Tensor) -> None:
+    torch.mps.synchronize()
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    _MPS_GPTQ_PROFILE_TOTALS[name] = (
+        _MPS_GPTQ_PROFILE_TOTALS.get(name, 0.0) + elapsed_ms
+    )
+    _MPS_GPTQ_PROFILE_COUNTS[name] = _MPS_GPTQ_PROFILE_COUNTS.get(name, 0) + 1
+    count = _MPS_GPTQ_PROFILE_COUNTS[name]
+    if count % 200 == 0:
+        logger.info(
+            "MPS profile auto_gptq %s: total=%.2fms count=%d avg=%.3fms",
+            name,
+            _MPS_GPTQ_PROFILE_TOTALS[name],
+            count,
+            _MPS_GPTQ_PROFILE_TOTALS[name] / count,
+        )
+
+
+def _unpack_gptq_rows(packed: torch.Tensor, bits: int) -> torch.Tensor:
+    pack_factor = 32 // bits
+    shifts = torch.arange(pack_factor, dtype=torch.int32) * bits
+    unpacked = (packed.to(torch.int32).unsqueeze(-1) >> shifts) & ((1 << bits) - 1)
+    return unpacked.permute(0, 2, 1).reshape(packed.shape[0] * pack_factor, -1)
+
+
+def _unpack_gptq_cols(packed: torch.Tensor, bits: int) -> torch.Tensor:
+    pack_factor = 32 // bits
+    shifts = torch.arange(pack_factor, dtype=torch.int32) * bits
+    unpacked = (packed.to(torch.int32).unsqueeze(-1) >> shifts) & ((1 << bits) - 1)
+    return unpacked.reshape(packed.shape[0], packed.shape[1] * pack_factor)
+
+
+def _dequantize_gptq_weight(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    bits: int,
+    group_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    qweight_cpu = qweight.detach().cpu()
+    scales_cpu = scales.detach().cpu().to(torch.float32)
+    qzeros_cpu = qzeros.detach().cpu()
+
+    weight = _unpack_gptq_rows(qweight_cpu, bits).to(torch.float32)
+    zeros = _unpack_gptq_cols(qzeros_cpu, bits).to(torch.float32) + 1
+    input_size = weight.shape[0]
+
+    normalized_group_size = input_size if group_size == -1 else group_size
+    group_ids = torch.arange(input_size, dtype=torch.long) // normalized_group_size
+    group_ids.clamp_(0, scales_cpu.shape[0] - 1)
+
+    weight = (weight - zeros[group_ids]) * scales_cpu[group_ids]
+    # vLLM linear weights are [out_features, in_features].
+    return weight.t().contiguous().to(device=device, dtype=dtype)
 
 
 def get_moe_quant_method(
@@ -312,12 +449,15 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         self.quant_config = quant_config
         self.input_dtype = None
         self.quant_type = self.quant_config.quant_type
+        self._use_mps_dequant = current_platform.is_mps()
+        self._use_mps_direct_gemv = False
 
         # Verify supported on platform.
-        verify_marlin_supported(
-            quant_type=self.quant_config.quant_type,
-            group_size=self.quant_config.group_size,
-        )
+        if not self._use_mps_dequant:
+            verify_marlin_supported(
+                quant_type=self.quant_config.quant_type,
+                group_size=self.quant_config.group_size,
+            )
 
     def create_weights(
         self,
@@ -334,23 +474,29 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
         input_dtype = self.input_dtype
 
-        mp_linear_kernel_config = MPLinearLayerConfig(
-            full_weight_shape=(input_size, output_size),
-            partition_weight_shape=(
-                input_size_per_partition,
-                output_size_per_partition,
-            ),
-            weight_type=self.quant_config.quant_type,
-            act_type=params_dtype if input_dtype is None else input_dtype,
-            group_size=self.quant_config.group_size,
-            zero_points=False,
-        )
+        if self._use_mps_dequant:
+            kernel_type = None
+            if _MPS_GPTQ_BACKEND_NAME not in self._kernel_backends_being_used:
+                logger.info("Using %s for AutoGPTQLinearMethod", _MPS_GPTQ_BACKEND_NAME)
+                self._kernel_backends_being_used.add(_MPS_GPTQ_BACKEND_NAME)
+        else:
+            mp_linear_kernel_config = MPLinearLayerConfig(
+                full_weight_shape=(input_size, output_size),
+                partition_weight_shape=(
+                    input_size_per_partition,
+                    output_size_per_partition,
+                ),
+                weight_type=self.quant_config.quant_type,
+                act_type=params_dtype if input_dtype is None else input_dtype,
+                group_size=self.quant_config.group_size,
+                zero_points=False,
+            )
 
-        kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
+            kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
 
-        if kernel_type.__name__ not in self._kernel_backends_being_used:
-            logger.info("Using %s for AutoGPTQLinearMethod", kernel_type.__name__)
-            self._kernel_backends_being_used.add(kernel_type.__name__)
+            if kernel_type.__name__ not in self._kernel_backends_being_used:
+                logger.info("Using %s for AutoGPTQLinearMethod", kernel_type.__name__)
+                self._kernel_backends_being_used.add(kernel_type.__name__)
 
         # Normalize group_size
         if self.quant_config.group_size != -1:
@@ -428,15 +574,69 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         layer.register_parameter("scales", scales)
         layer.register_parameter("qzeros", qzeros)
 
-        self.kernel = kernel_type(
-            mp_linear_kernel_config,
-            w_q_param_name="qweight",
-            w_s_param_name="scales",
-            w_zp_param_name="qzeros",
-        )
+        if kernel_type is not None:
+            self.kernel = kernel_type(
+                mp_linear_kernel_config,
+                w_q_param_name="qweight",
+                w_s_param_name="scales",
+                w_zp_param_name="qzeros",
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self._use_mps_dequant:
+            self._use_mps_direct_gemv = self._can_use_mps_direct_gemv(layer)
+            if self._use_mps_direct_gemv:
+                layer.qweight.data = layer.qweight.data.contiguous()
+                layer.scales.data = layer.scales.data.contiguous()
+
+            weight = _dequantize_gptq_weight(
+                layer.qweight.data,
+                layer.scales.data,
+                layer.qzeros.data,
+                self.quant_config.quant_type.size_bits,
+                self.quant_config.group_size,
+                layer.params_dtype,
+                layer.qweight.device,
+            )
+            names_to_remove = (
+                ("qzeros",)
+                if self._use_mps_direct_gemv
+                else ("qweight", "scales", "qzeros")
+            )
+            for name in names_to_remove:
+                if hasattr(layer, name):
+                    delattr(layer, name)
+            layer.register_parameter(
+                "weight", torch.nn.Parameter(weight, requires_grad=False)
+            )
+            return
+
         self.kernel.process_weights_after_loading(layer)
+
+    def _can_use_mps_direct_gemv(self, layer: torch.nn.Module) -> bool:
+        if not envs.VLLM_MPS_GPTQ_DIRECT_GEMV:
+            return False
+        if self.quant_config.quant_type.size_bits != 4:
+            return False
+        if self.quant_config.group_size != 128 or not self.quant_config.is_sym:
+            return False
+        if layer.params_dtype != torch.float16:
+            return False
+
+        input_size = layer.qweight.shape[0] * self.quant_config.pack_factor
+        output_size = layer.qweight.shape[1]
+        if input_size % self.quant_config.pack_factor != 0:
+            return False
+        if output_size < _MPS_GPTQ_DIRECT_MIN_OUTPUT_SIZE:
+            return False
+
+        qzeros = layer.qzeros.detach().cpu()
+        if qzeros.numel() == 0:
+            return False
+        first_zero_word = int(qzeros.flatten()[0])
+        if first_zero_word != _MPS_GPTQ_DIRECT_ZERO_WORD:
+            return False
+        return bool(torch.all(qzeros == first_zero_word).item())
 
     def apply(
         self,
@@ -444,7 +644,67 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self._use_mps_dequant:
+            profile = _mps_gptq_profile_active(x)
+            if self._use_mps_direct_gemv:
+                started = _mps_gptq_profile_start(x) if profile else 0.0
+                direct_output = self._apply_mps_direct_gemv(layer, x, bias)
+                if direct_output is not None:
+                    if profile:
+                        rows = x.reshape(-1, x.shape[-1]).shape[0]
+                        _mps_gptq_profile_log(
+                            f"direct rows={rows} in={x.shape[-1]} "
+                            f"out={layer.qweight.shape[1]}",
+                            started,
+                            x,
+                        )
+                    return direct_output
+            started = _mps_gptq_profile_start(x) if profile else 0.0
+            output = F.linear(x, layer.weight, bias)
+            if profile:
+                rows = x.reshape(-1, x.shape[-1]).shape[0]
+                _mps_gptq_profile_log(
+                    f"dense rows={rows} in={x.shape[-1]} out={layer.weight.shape[0]}",
+                    started,
+                    x,
+                )
+            return output
         return self.kernel.apply_weights(layer, x, bias)
+
+    def _apply_mps_direct_gemv(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if x.device.type != "mps" or x.dtype != torch.float16:
+            return None
+        input_size = layer.qweight.shape[0] * self.quant_config.pack_factor
+        if x.shape[-1] != input_size:
+            return None
+        if not x.is_contiguous():
+            return None
+        x_2d = x.reshape(-1, input_size)
+        rows = x_2d.shape[0]
+        if rows != 1:
+            return None
+
+        output_size = layer.qweight.shape[1]
+        out = torch.empty((rows, output_size), device=x.device, dtype=x.dtype)
+        lib = _get_mps_gptq_direct_gemv_lib()
+        lib.gptq_gemv_vec8_simd32(
+            x_2d,
+            layer.qweight,
+            layer.scales,
+            out,
+            output_size,
+            input_size,
+            self.quant_config.group_size,
+            threads=(32, (output_size + 7) // 8, 1),
+            group_size=(32, 1, 1),
+        )
+        out = out.reshape(*x.shape[:-1], output_size)
+        return out if bias is None else out + bias
 
 
 class AutoGPTQMoEMethod(FusedMoEMethodBase):

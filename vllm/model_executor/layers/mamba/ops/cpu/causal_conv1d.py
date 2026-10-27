@@ -20,6 +20,7 @@ def causal_conv1d_fn_cpu(
     has_initial_state: torch.Tensor | None = None,
     activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
+    null_block_id: int | None = None,
     **kwargs,
 ) -> torch.Tensor:
     """CPU implementation for causal_conv1d_fwd."""
@@ -45,16 +46,22 @@ def causal_conv1d_fn_cpu(
         if bos == eos:
             continue
 
-        slot = (
-            int(cache_indices[seq_idx].item()) if cache_indices is not None else seq_idx
-        )
+        if cache_indices is None:
+            slot = seq_idx
+        elif cache_indices.dim() == 1:
+            slot = int(cache_indices[seq_idx].item())
+        else:
+            slot = int(cache_indices[seq_idx, 0].item())
 
-        if slot == pad_slot_id:
+        if slot == pad_slot_id or (null_block_id is not None and slot == null_block_id):
+            out[:, bos:eos].zero_()
             continue
 
         seq_x = x[:, bos:eos].unsqueeze(0)
-
-        if has_initial_state is not None and bool(has_initial_state[seq_idx].item()):
+        has_state = has_initial_state is not None and bool(
+            has_initial_state[seq_idx].item()
+        )
+        if has_state:
             initial_state = conv_states[slot, :, :state_len].unsqueeze(0)
         else:
             initial_state = torch.zeros(

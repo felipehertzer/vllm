@@ -256,6 +256,36 @@ def _sync_if_cuda(device: torch.device) -> None:
         torch.accelerator.synchronize(device)
 
 
+def _mps_profile_enabled() -> bool:
+    return envs.VLLM_MPS_PROFILE
+
+
+class _MPSRunnerProfiler:
+    def __init__(self, name: str, device: torch.device) -> None:
+        self.name = name
+        self.device = device
+        self.enabled = device.type == "mps" and _mps_profile_enabled()
+        self.started = time.perf_counter()
+        self.previous = self.started
+
+    def mark(self, label: str, **info: object) -> None:
+        if not self.enabled:
+            return
+        torch.mps.synchronize()
+        now = time.perf_counter()
+        details = " ".join(f"{key}={value}" for key, value in info.items())
+        logger.info(
+            "MPS profile %s %s: +%.2fms total=%.2fms%s%s",
+            self.name,
+            label,
+            (now - self.previous) * 1000,
+            (now - self.started) * 1000,
+            " " if details else "",
+            details,
+        )
+        self.previous = now
+
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -2680,8 +2710,15 @@ class GPUModelRunner(
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        draft_token_ids = self.input_ids.gpu[logits_indices]
-        draft_token_ids = draft_token_ids[target_logits_indices + 1]
+        if self.device.type == "mps":
+            draft_token_ids = self.input_ids.gpu[logits_indices.to(torch.long)]
+            draft_token_ids = draft_token_ids[
+                (target_logits_indices + 1).to(torch.long)
+            ]
+            torch.mps.synchronize()
+        else:
+            draft_token_ids = self.input_ids.gpu[logits_indices]
+            draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
@@ -4095,6 +4132,7 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        mps_profile = _MPSRunnerProfiler("execute_model", self.device)
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
@@ -4288,6 +4326,11 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+        mps_profile.mark(
+            "preprocess",
+            tokens=num_scheduled_tokens,
+            reqs=self.input_batch.num_reqs,
+        )
 
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
@@ -4335,6 +4378,7 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        mps_profile.mark("forward")
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4387,6 +4431,7 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+        mps_profile.mark("postprocess_logits")
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -4407,6 +4452,7 @@ class GPUModelRunner(
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
+        mps_profile.mark("ready_for_sampling")
         return None
 
     def _input_fits_in_drafter(
@@ -4428,6 +4474,7 @@ class GPUModelRunner(
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        mps_profile = _MPSRunnerProfiler("sample_tokens", self.device)
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
@@ -4459,13 +4506,16 @@ class GPUModelRunner(
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
+        mps_profile.mark("grammar_bitmask", has_grammar=grammar_output is not None)
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        mps_profile.mark("sample")
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
+        mps_profile.mark("state_update")
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
@@ -4605,6 +4655,7 @@ class GPUModelRunner(
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
+        mps_profile.mark("bookkeeping")
 
         if draft_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -4653,8 +4704,10 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
             )
+        mps_profile.mark("output")
 
         if not self.use_async_scheduling:
+            mps_profile.mark("return_sync")
             return output
 
         with record_function_or_nullcontext(

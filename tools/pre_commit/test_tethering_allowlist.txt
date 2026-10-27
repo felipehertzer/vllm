@@ -54,6 +54,7 @@ tests/v1/kv_connector/nixl_integration/test_disagg_accuracy.py  # run by intel_j
 
 # tests/platforms/
 tests/platforms/test_cpu.py  # CPU-only unit test; no job targets tests/platforms/
+tests/platforms/test_mps.py  # Apple MPS unit test; no job targets tests/platforms/ or runs on macOS
 
 # tests/tools/
 tests/tools/test_config_validator.py  # logic covered by the validate-config pre-commit hook; no test_areas job

@@ -96,7 +96,7 @@ def is_metadata_only_build() -> bool:
     return bool({"egg_info", "dist_info"}.intersection(sys.argv[1:]))
 
 
-if sys.platform.startswith("darwin") and VLLM_TARGET_DEVICE != "cpu":
+if sys.platform.startswith("darwin") and VLLM_TARGET_DEVICE not in ("cpu", "mps"):
     logger.warning("VLLM_TARGET_DEVICE automatically set to `cpu` due to macOS")
     VLLM_TARGET_DEVICE = "cpu"
 elif not (sys.platform.startswith("linux") or sys.platform.startswith("darwin")):
@@ -1293,6 +1293,10 @@ def _is_xpu() -> bool:
     return VLLM_TARGET_DEVICE == "xpu"
 
 
+def _is_mps() -> bool:
+    return VLLM_TARGET_DEVICE == "mps"
+
+
 def _build_custom_ops() -> bool:
     return _is_cuda() or _is_hip()
 
@@ -1394,6 +1398,8 @@ def get_vllm_version() -> str:
             # not envs.VLLM_TARGET_DEVICE, so CPU-only hosts still get `+cpu`.
             if VLLM_TARGET_DEVICE == "cpu":
                 version += f"{sep}cpu"
+        elif _is_mps():
+            version += f"{sep}mps"
         elif _is_xpu():
             version += f"{sep}xpu"
         else:
@@ -1519,12 +1525,12 @@ def get_requirements() -> list[str]:
         requirements += get_rocm_device_requirements()
     elif _is_tpu():
         requirements = _read_requirements("tpu.txt")
-    elif _is_cpu():
+    elif _is_cpu() or _is_mps():
         requirements = _read_requirements("cpu.txt")
     elif _is_xpu():
         requirements = _read_requirements("xpu.txt")
     else:
-        raise ValueError("Unsupported platform, please use CUDA, ROCm, or CPU.")
+        raise ValueError("Unsupported platform, please use CUDA, ROCm, MPS, or CPU.")
     return requirements
 
 
@@ -1602,7 +1608,7 @@ if _is_cuda():
     # tml-fa4 is copied into an isolated vllm.third_party package.
     ext_modules.append(CMakeExtension(name="vllm.tml_fa4", optional=True))
 
-if _is_cpu():
+if _is_cpu() or _is_mps():
     import platform
 
     if platform.machine() in ("x86_64", "AMD64"):

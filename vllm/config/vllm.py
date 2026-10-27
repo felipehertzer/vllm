@@ -1667,6 +1667,10 @@ class VllmConfig:
                 v1_async_sched_incompat = "pipeline parallelism"
 
         if self.scheduler_config.async_scheduling:
+            if current_platform.is_mps():
+                raise ValueError(
+                    "Async scheduling uses CUDA streams and is not supported on MPS."
+                )
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             if uses_rocm_deepep_ht_dbo:
                 raise ValueError(
@@ -1685,7 +1689,10 @@ class VllmConfig:
                 )
         elif self.scheduler_config.async_scheduling is None:
             # Enable async scheduling unless there is an incompatible option.
-            if (
+            if current_platform.is_mps():
+                logger.debug("Disabling asynchronous scheduling by default on MPS.")
+                self.scheduler_config.async_scheduling = False
+            elif (
                 self.model_config is not None
                 and self.model_config.runner_type == "pooling"
             ):

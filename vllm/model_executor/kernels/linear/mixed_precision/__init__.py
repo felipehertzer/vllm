@@ -29,6 +29,9 @@ from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
     MPLinearKernel,
     MPLinearLayerConfig,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.mps import (
+    MPSWNA16LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.rdna3_w4a16 import (
     RDNA3W4A16LinearKernel,
 )
@@ -57,6 +60,7 @@ __all__ = [
     "HummingLinearKernel",
     "MacheteLinearKernel",
     "MarlinLinearKernel",
+    "MPSWNA16LinearKernel",
     "RDNA3W4A16LinearKernel",
     "RDNAHybridW4A16LinearKernel",
     "TritonW4A16LinearKernel",

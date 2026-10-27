@@ -82,6 +82,8 @@ if TYPE_CHECKING:
     VLLM_MAX_AUDIO_DECODE_DURATION_S: int = 600
     VLLM_MAX_AUDIO_DECODE_BYTES: int = 268_435_456
     VLLM_MAX_AUDIO_PREPROCESS_WORKERS: int = max(1, min(os.cpu_count() or 1, 2))
+    VLLM_MPS_PROFILE: bool = False
+    VLLM_MPS_GPTQ_DIRECT_GEMV: bool = True
     VLLM_MAX_EMBED_DECODE_BYTES: int = 2_147_483_648
     VLLM_MAX_IMAGE_PIXELS: int = 178_956_970
     VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES: int = 715_827_880
@@ -623,8 +625,14 @@ def _resolve_rust_cli_path() -> str | None:
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
-    # rocm, cpu]
+    # rocm, xpu, cpu, mps]
     "VLLM_TARGET_DEVICE": lambda: os.getenv("VLLM_TARGET_DEVICE", "cuda").lower(),
+    # Enable coarse MPS runner phase timings for local optimization.
+    "VLLM_MPS_PROFILE": lambda: bool(int(os.getenv("VLLM_MPS_PROFILE", "0"))),
+    # Enable the MPS AutoGPTQ direct single-row GEMV kernel.
+    "VLLM_MPS_GPTQ_DIRECT_GEMV": lambda: bool(
+        int(os.getenv("VLLM_MPS_GPTQ_DIRECT_GEMV", "1"))
+    ),
     # Main CUDA version of vLLM. This follows PyTorch but can be overridden.
     "VLLM_MAIN_CUDA_VERSION": lambda: (
         os.getenv("VLLM_MAIN_CUDA_VERSION", "").lower() or "13.0"
@@ -2094,10 +2102,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DBO_COMM_SMS": lambda: int(
         os.getenv(
             "VLLM_DBO_COMM_SMS",
-            "64"
-            if hasattr(__import__("torch").version, "hip")
-            and __import__("torch").version.hip is not None
-            else "20",
+            (
+                "64"
+                if hasattr(__import__("torch").version, "hip")
+                and __import__("torch").version.hip is not None
+                else "20"
+            ),
         )
     ),
     # Enable max_autotune & coordinate_descent_tuning in inductor_config

@@ -40,7 +40,7 @@ uv pip install -e .
 ```
 
 !!! note
-    On macOS the `VLLM_TARGET_DEVICE` is automatically set to `cpu`, which is currently the only supported device.
+    On macOS the `VLLM_TARGET_DEVICE` is automatically set to `cpu` unless it is explicitly set. This fork also supports experimental Apple Metal execution with `VLLM_TARGET_DEVICE=mps` for unquantized PyTorch/safetensors checkpoints.
 
 !!! example "Troubleshooting"
     If the build fails with errors like the following where standard C++ headers cannot be found, try to remove and reinstall your

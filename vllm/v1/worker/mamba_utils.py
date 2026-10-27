@@ -10,6 +10,7 @@ import torch
 from vllm.config import CacheConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateCopyFunc,
     MambaStateCopyFuncsByType,
     get_conv_copy_spec,
     get_temporal_copy_spec,
@@ -664,6 +665,31 @@ def batch_memcpy(src_ptrs, dst_ptrs, sizes):
     batch_memcpy_kernel[grid](src_ptrs, dst_ptrs, sizes, BLOCK_SIZE=BLOCK_SIZE)
 
 
+def _get_mamba_copy_source_tensor(
+    state: torch.Tensor,
+    block_ids: list[int],
+    src_block_idx: int,
+    num_accepted_tokens: int,
+    state_copy_func: MambaStateCopyFunc,
+) -> torch.Tensor:
+    if state_copy_func is get_conv_copy_spec:
+        src_block_id = block_ids[src_block_idx]
+        offset = num_accepted_tokens - 1
+        if is_conv_state_dim_first():
+            assert offset == 0, (
+                "DS conv state with num_accepted_tokens > 1 must be handled "
+                "by the fused postprocess kernel."
+            )
+            return state[src_block_id]
+        return state[src_block_id, offset:]
+
+    if state_copy_func is get_temporal_copy_spec:
+        src_block_id = block_ids[src_block_idx + num_accepted_tokens - 1]
+        return state[src_block_id]
+
+    raise ValueError(f"Unsupported Mamba state copy function: {state_copy_func!r}")
+
+
 def _get_mamba_spec_for_layer(
     kv_cache_group: KVCacheGroupSpec, layer_name: str
 ) -> MambaSpec:
@@ -725,6 +751,9 @@ class MambaCopyBuffers:
     mamba_group_ids: list[int]
     mamba_spec: MambaSpec
     offset: int = 0
+    tensor_copies: list[tuple[torch.Tensor, torch.Tensor]] = dataclasses.field(
+        default_factory=list
+    )
 
     @classmethod
     def create(
@@ -1360,6 +1389,8 @@ def collect_mamba_copy_meta(
     dst_ptrs_np = copy_bufs.dst_ptrs.np
     sizes_np = copy_bufs.sizes.np
     offset = copy_bufs.offset
+    if offset == 0:
+        copy_bufs.tensor_copies.clear()
 
     for mamba_group_id in mamba_group_ids:
         block_ids = req_state.block_ids[mamba_group_id]
@@ -1376,9 +1407,20 @@ def collect_mamba_copy_meta(
                     state, block_ids, src_block_idx, accept_token_bias + 1
                 )
 
-                src_ptrs_np[offset] = copy_spec.start_addr
-                dst_ptrs_np[offset] = state[dest_block_id].data_ptr()
-                sizes_np[offset] = copy_spec.num_elements * state.element_size()
+                if state.device.type in ("cuda", "xpu"):
+                    src_ptrs_np[offset] = copy_spec.start_addr
+                    dst_ptrs_np[offset] = state[dest_block_id].data_ptr()
+                    sizes_np[offset] = copy_spec.num_elements * state.element_size()
+                else:
+                    src = _get_mamba_copy_source_tensor(
+                        state,
+                        block_ids,
+                        src_block_idx,
+                        accept_token_bias + 1,
+                        state_copy_func,
+                    )
+                    dst = state[dest_block_id]
+                    copy_bufs.tensor_copies.append((src, dst))
                 offset += 1
 
     copy_bufs.offset = offset
@@ -1387,6 +1429,12 @@ def collect_mamba_copy_meta(
 def do_mamba_copy_block(copy_bufs: MambaCopyBuffers):
     n = copy_bufs.offset
     if n == 0:
+        return
+    if copy_bufs.tensor_copies:
+        for src, dst in copy_bufs.tensor_copies:
+            src_flat = src.reshape(-1)
+            dst.view(-1)[: src_flat.numel()].copy_(src_flat)
+        copy_bufs.tensor_copies.clear()
         return
     batch_memcpy(
         copy_bufs.src_ptrs.copy_to_gpu(n),
