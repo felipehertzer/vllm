@@ -168,6 +168,9 @@ class GuidanceBackend(StructuredOutputBackend):
         self.disable_additional_properties = (
             self.vllm_config.structured_outputs_config.disable_additional_properties
         )
+        self.json_separators = (
+            self.vllm_config.structured_outputs_config.json_separators
+        )
 
         if not self.is_tokenizer_supported(self.tokenizer):
             raise ValueError(
@@ -188,6 +191,7 @@ class GuidanceBackend(StructuredOutputBackend):
             grammar_spec,
             self.disable_any_whitespace,
             self.disable_additional_properties,
+            self.json_separators,
         )
 
         ll_matcher = llguidance.LLMatcher(
@@ -304,27 +308,28 @@ def serialize_guidance_grammar(
     grammar_spec: str | dict[str, Any],
     disable_any_whitespace: bool = False,
     disable_additional_properties: bool = False,
+    json_separators: tuple[str, str] | None = None,
 ) -> str:
+    json_defaults: dict[str, Any] = {"whitespace_flexible": not disable_any_whitespace}
+    if json_separators is not None:
+        json_defaults["item_separator"], json_defaults["key_separator"] = (
+            json_separators
+        )
+
     def _process_schema(
         grammar_spec: str | dict[str, Any],
     ) -> str:
         if disable_additional_properties:
             grammar_spec = process_for_additional_properties(grammar_spec)
         return llguidance.LLMatcher.grammar_from_json_schema(
-            grammar_spec,
-            defaults={
-                "whitespace_flexible": not disable_any_whitespace,
-            },
+            grammar_spec, defaults=json_defaults
         )
 
     if request_type == StructuredOutputOptions.JSON:
         return _process_schema(grammar_spec)
     elif request_type == StructuredOutputOptions.JSON_OBJECT:
         return llguidance.LLMatcher.grammar_from_json_schema(
-            '{"type": "object"}',
-            defaults={
-                "whitespace_flexible": not disable_any_whitespace,
-            },
+            '{"type": "object"}', defaults=json_defaults
         )
     else:
         if request_type == StructuredOutputOptions.REGEX:

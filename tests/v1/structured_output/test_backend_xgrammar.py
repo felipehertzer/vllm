@@ -539,17 +539,22 @@ class TestXgrammarBackend:
         _VOCAB_SIZE = 50257
         tokenizer: ClassVar[PreTrainedTokenizerBase]
 
-        @classmethod
         @pytest.fixture(scope="class", autouse=True)
-        def _shared_tokenizer(cls):
-            cls.tokenizer = AutoTokenizer.from_pretrained(cls._TOKENIZER)
+        def _shared_tokenizer(self, request):
+            request.cls.tokenizer = AutoTokenizer.from_pretrained(self._TOKENIZER)
 
         @classmethod
-        def _backend(cls, *, disable_any_whitespace: bool) -> XgrammarBackend:
+        def _backend(
+            cls,
+            *,
+            disable_any_whitespace: bool,
+            json_separators: tuple[str, str] | None = None,
+        ) -> XgrammarBackend:
             vllm_config = VllmConfig(
                 structured_outputs_config=StructuredOutputsConfig(
                     backend="xgrammar",
                     disable_any_whitespace=disable_any_whitespace,
+                    json_separators=json_separators,
                 )
             )
             return XgrammarBackend(
@@ -609,3 +614,14 @@ class TestXgrammarBackend:
             #     backend,
             #     '{"where_space_after_comma":42, "wow_thats_cool":4242}',
             # )
+
+        def test_json_separators_keep_the_given_spacing(self):
+            """disable_any_whitespace with json_separators writes exactly them."""
+            backend = self._backend(
+                disable_any_whitespace=True, json_separators=(", ", ": ")
+            )
+
+            assert self._accepts_json(backend, '{"spaced": true, "like": "json.dumps"}')
+            assert not self._accepts_json(backend, '{"compact":true}')
+            assert not self._accepts_json(backend, '{"wide":  true}')
+            assert not self._accepts_json(backend, '{\n"indented": true}')

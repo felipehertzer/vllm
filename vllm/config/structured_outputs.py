@@ -32,6 +32,11 @@ class StructuredOutputsConfig:
     If `False`, the model may generate whitespace between JSON fields,
     which is still valid JSON. This is only supported for xgrammar
     and guidance backends."""
+    json_separators: tuple[str, str] | None = None
+    """The item and key separators of JSON output when `disable_any_whitespace`
+    is `True`, e.g. `[", ", ": "]` for the spacing of Python's `json.dumps`.
+    `None` keeps the output compact (`[",", ":"]`). Models trained on spaced
+    JSON can write worse content when forced into the compact form."""
     disable_additional_properties: bool = False
     """If `True`, the `guidance` backend will not use `additionalProperties`
     in the JSON schema. This is only supported for the `guidance` backend and
@@ -69,6 +74,8 @@ class StructuredOutputsConfig:
                 "disable_any_whitespace is only supported for "
                 "xgrammar and guidance backends."
             )
+        if self.json_separators is not None and not self.disable_any_whitespace:
+            raise ValueError("json_separators requires disable_any_whitespace.")
         if self.disable_additional_properties and self.backend != "guidance":
             raise ValueError(
                 "disable_additional_properties is only supported "

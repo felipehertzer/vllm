@@ -18,6 +18,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.structured_output.backend_guidance import (
     GuidanceBackend,
     process_for_additional_properties,
+    serialize_guidance_grammar,
 )
 from vllm.v1.structured_output.backend_types import StructuredOutputOptions
 
@@ -338,3 +339,26 @@ def test_disable_additional_properties_accepts_literal_with_properties_key(
 
     assert grammar.validate_tokens(valid_tokens) == valid_tokens
     assert grammar.validate_tokens(rewritten_tokens) != rewritten_tokens
+
+
+def test_serialize_guidance_grammar_passes_json_separators():
+    grammar = json.loads(
+        serialize_guidance_grammar(
+            StructuredOutputOptions.JSON_OBJECT,
+            "",
+            disable_any_whitespace=True,
+            json_separators=(", ", ": "),
+        )
+    )
+
+    options = grammar["grammars"][0]["json_schema"]["x-guidance"]
+    assert options == {
+        "whitespace_flexible": False,
+        "item_separator": ", ",
+        "key_separator": ": ",
+    }
+
+
+def test_json_separators_require_disable_any_whitespace():
+    with pytest.raises(ValueError, match="json_separators requires"):
+        StructuredOutputsConfig(backend="guidance", json_separators=(", ", ": "))

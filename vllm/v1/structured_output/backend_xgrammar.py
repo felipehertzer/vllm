@@ -40,6 +40,9 @@ class XgrammarBackend(StructuredOutputBackend):
         self.disable_any_whitespace = (
             self.vllm_config.structured_outputs_config.disable_any_whitespace
         )
+        self.json_separators = (
+            self.vllm_config.structured_outputs_config.json_separators
+        )
         model_config = self.vllm_config.model_config
         is_plamo3 = (
             model_config is not None and model_config.hf_config.model_type == "plamo3"
@@ -141,7 +144,11 @@ class XgrammarBackend(StructuredOutputBackend):
         # Upd. this bug was fixed in xgrammar main branch on Oct 8, 2026
         # and will be available in next release.
         # So, remove this comment once xgrammar updates to v0.2.9
-        separators = (",", ":") if self.disable_any_whitespace else None
+        separators = (
+            (self.json_separators or (",", ":"))
+            if self.disable_any_whitespace
+            else None
+        )
         if request_type == StructuredOutputOptions.JSON:
             ctx = self.compiler.compile_json_schema(
                 grammar_spec,
