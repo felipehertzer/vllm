@@ -10,7 +10,12 @@ import pytest
 import soundfile as sf
 
 from vllm.multimodal.media import AudioMediaIO
-from vllm.multimodal.media.audio import load_audio, load_audio_soundfile
+from vllm.multimodal.media.audio import (
+    load_audio,
+    load_audio_pyav,
+    load_audio_soundfile,
+)
+from vllm.utils.import_utils import PlaceholderModule
 
 from ...conftest import AudioTestAssets
 
@@ -190,3 +195,51 @@ def test_load_audio_threads_max_decode_bytes():
             max_duration_s=600,
             max_decode_bytes=512 * 1024,
         )
+
+
+def _pcm_bytes(signal: np.ndarray, channels: int, fmt: str, subtype: str) -> bytes:
+    buf = BytesIO()
+    data = np.repeat(signal[:, None], channels, axis=1)
+    sf.write(buf, data, 16000, format=fmt, subtype=subtype)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("fmt", "subtype", "atol"),
+    [
+        ("WAV", "PCM_16", 1e-4),
+        ("WAV", "PCM_32", 1e-4),
+        ("WAV", "PCM_U8", 1e-2),
+        ("FLAC", "PCM_16", 1e-4),
+    ],
+)
+@pytest.mark.parametrize("channels", [1, 2])
+def test_load_audio_pyav_scales_integer_pcm_at_native_rate(
+    fmt, subtype, atol, channels
+):
+    """Integer and interleaved PCM decoded at the native rate must come back
+    as mono float in [-1, 1], the same as audio that needs resampling."""
+    signal = 0.5 * np.sin(np.linspace(0, 40 * np.pi, 1600)).astype(np.float32)
+    payload = _pcm_bytes(signal, channels, fmt, subtype)
+
+    y, sr = load_audio_pyav(BytesIO(payload), sr=16000)
+
+    assert sr == 16000
+    assert y.shape == signal.shape
+    np.testing.assert_allclose(y, signal, atol=atol)
+
+
+def test_load_audio_without_soundfile_decodes_with_pyav():
+    """Without soundfile installed every format goes to PyAV, quietly."""
+    signal = 0.5 * np.sin(np.linspace(0, 40 * np.pi, 1600)).astype(np.float32)
+    payload = _pcm_bytes(signal, 1, "WAV", "PCM_16")
+
+    with (
+        patch("vllm.multimodal.media.audio.soundfile", PlaceholderModule("soundfile")),
+        patch("vllm.multimodal.media.audio.logger") as logger,
+    ):
+        y, sr = load_audio(BytesIO(payload), sr=16000, filename="clip.wav")
+
+    assert sr == 16000
+    np.testing.assert_allclose(y, signal, atol=1e-4)
+    logger.error.assert_not_called()
