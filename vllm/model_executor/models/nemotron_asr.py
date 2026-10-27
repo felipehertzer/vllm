@@ -346,94 +346,10 @@ def _nemotron_sdpa_attention(
     )
 
 
-def _nemotron_attention_window(config) -> tuple[int, int] | None:
-    """(chunk_size, left_chunks) when every query sees a bounded key window."""
-    att_context_left = int(getattr(config, "att_context_left", -1))
-    att_context_right = int(getattr(config, "att_context_right", -1))
-    if (
-        getattr(config, "att_context_style", "regular") != "chunked_limited"
-        or att_context_left < 0
-        or att_context_right < 0
-    ):
-        return None
-    chunk_size = att_context_right + 1
-    return chunk_size, att_context_left // chunk_size
-
-
-def _nemotron_chunked_attention(
-    query_states_with_bias_u: torch.Tensor,
-    query_states_with_bias_v: torch.Tensor,
-    key_states: torch.Tensor,
-    value_states: torch.Tensor,
-    relative_key_states: torch.Tensor,
-    valid_mask: torch.Tensor,
-    scaling: float,
-    chunk_size: int,
-    left_chunks: int,
-) -> torch.Tensor:
-    """chunked_limited attention computed per query chunk over its key window.
-
-    Equal to the dense masked attention, in memory linear in the sequence
-    length instead of quadratic: a chunk of queries attends only to itself and
-    the ``left_chunks`` chunks before it.
-    """
-    batch_size, num_heads, seq_length, head_dim = query_states_with_bias_u.shape
-    device = query_states_with_bias_u.device
-    left = left_chunks * chunk_size
-    window = left + chunk_size
-    num_chunks = -(-seq_length // chunk_size)
-    right_pad = num_chunks * chunk_size - seq_length
-
-    def chunked(states: torch.Tensor) -> torch.Tensor:
-        return F.pad(states, (0, 0, 0, right_pad)).view(
-            batch_size, num_heads, num_chunks, chunk_size, head_dim
-        )
-
-    def windows(states: torch.Tensor) -> torch.Tensor:
-        padded = F.pad(states, (0, 0, left, right_pad))
-        return padded.unfold(2, window, chunk_size).transpose(-2, -1)
-
-    # Query offset a and window slot w are (left + a - w) frames apart. Score
-    # each query against every distance a window can hold, then pick per slot.
-    # relative_key_states rows run from distance seq_length - 1 down to
-    # -(seq_length - 1); distances beyond the sequence only meet padded slots.
-    distances = torch.arange(left + chunk_size - 1, -chunk_size, -1, device=device)
-    rows = (seq_length - 1 - distances).clamp(0, 2 * seq_length - 2)
-    position_scores = chunked(query_states_with_bias_v) @ relative_key_states[
-        :, :, rows
-    ].transpose(-2, -1).unsqueeze(2)
-    offsets = torch.arange(chunk_size, device=device)
-    slots = torch.arange(window, device=device)
-    picks = (chunk_size - 1 - offsets[:, None] + slots[None, :]).expand(
-        batch_size, num_heads, num_chunks, chunk_size, window
-    )
-    position_scores = position_scores.gather(-1, picks) * scaling
-
-    key_valid = F.pad(valid_mask, (left, right_pad)).unfold(1, window, chunk_size)
-    query_valid = F.pad(valid_mask, (0, right_pad)).view(
-        batch_size, num_chunks, chunk_size
-    )
-    allowed = key_valid[:, None, :, None, :] & query_valid[:, None, :, :, None]
-    position_scores = position_scores.masked_fill(allowed.logical_not(), float("-inf"))
-
-    output = F.scaled_dot_product_attention(
-        chunked(query_states_with_bias_u).flatten(1, 2),
-        windows(key_states).flatten(1, 2),
-        windows(value_states).flatten(1, 2),
-        attn_mask=position_scores.flatten(1, 2),
-        dropout_p=0.0,
-        scale=scaling,
-    )
-    return output.view(batch_size, num_heads, num_chunks * chunk_size, head_dim)[
-        :, :, :seq_length
-    ]
-
-
 class NemotronASRAttention(nn.Module):
     def __init__(self, attention: nn.Module) -> None:
         super().__init__()
         self.config = attention.config
-        self.window = _nemotron_attention_window(self.config)
         self.head_dim = attention.head_dim
         self.scaling = attention.scaling
         self.attention_dropout = attention.attention_dropout
@@ -463,15 +379,6 @@ class NemotronASRAttention(nn.Module):
         relative_key_states: torch.Tensor,
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        if self.window is not None:
-            return self._windowed_attention(
-                query_states_with_bias_u,
-                query_states_with_bias_v,
-                key_states,
-                value_states,
-                relative_key_states,
-                attention_mask,
-            )
         if (
             query_states_with_bias_u.device.type == "cuda"
             and self._cuda_compile_enabled()
@@ -499,53 +406,6 @@ class NemotronASRAttention(nn.Module):
             relative_key_states,
             attention_mask,
             self.scaling,
-        )
-
-    def _windowed_attention(
-        self,
-        query_states_with_bias_u: torch.Tensor,
-        query_states_with_bias_v: torch.Tensor,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        relative_key_states: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        assert self.window is not None
-        batch_size, _, seq_length, _ = query_states_with_bias_u.shape
-        # The encoder passes key validity as (batch, 1, 1, time) here.
-        valid_mask = (
-            torch.ones(
-                batch_size,
-                seq_length,
-                dtype=torch.bool,
-                device=query_states_with_bias_u.device,
-            )
-            if attention_mask is None
-            else attention_mask.reshape(batch_size, seq_length)
-        )
-        attention = _nemotron_chunked_attention
-        if (
-            query_states_with_bias_u.device.type == "cuda"
-            and self._cuda_compile_enabled()
-        ):
-            if self._compiled_cuda_attention is None:
-                self._compiled_cuda_attention = torch.compile(
-                    _nemotron_chunked_attention,
-                    mode="reduce-overhead",
-                    fullgraph=False,
-                )
-            attention = self._compiled_cuda_attention
-        chunk_size, left_chunks = self.window
-        return attention(
-            query_states_with_bias_u,
-            query_states_with_bias_v,
-            key_states,
-            value_states,
-            relative_key_states,
-            valid_mask,
-            self.scaling,
-            chunk_size,
-            left_chunks,
         )
 
     def forward(
@@ -771,8 +631,6 @@ class NemotronASREncoder(ParakeetEncoder):
         if bool(getattr(config, "causal_downsampling", False)):
             self.subsampling = NemotronASRCausalSubsamplingConv2D(config)
         self._patch_nemo_convolution_modules()
-        if _nemotron_attention_window(config) is not None:
-            self._patch_nemo_attention_modules()
 
     @staticmethod
     def _conv1d_without_bias(conv: nn.Conv1d) -> nn.Conv1d:
@@ -922,17 +780,10 @@ class NemotronASREncoder(ParakeetEncoder):
 
         encoder_attention_mask = None
         if attention_mask is not None:
-            if _nemotron_attention_window(self.config) is not None:
-                # Windowed attention only needs to know which frames are real.
-                encoder_attention_mask = self._get_output_attention_mask(
-                    attention_mask,
-                    target_length=hidden_states.shape[1],
-                )[:, None, None, :]
-            else:
-                encoder_attention_mask = self._get_nemo_attention_mask(
-                    attention_mask,
-                    target_length=hidden_states.shape[1],
-                )
+            encoder_attention_mask = self._get_nemo_attention_mask(
+                attention_mask,
+                target_length=hidden_states.shape[1],
+            )
 
         for encoder_layer in self.layers:
             to_drop = False
